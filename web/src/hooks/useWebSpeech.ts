@@ -94,6 +94,8 @@ export function useWebSpeech(): UseWebSpeechReturn {
       };
 
       recognition.onresult = (event: WebSpeechRecognitionEvent) => {
+        if (!sessionActiveRef.current) return;
+
         let newFinalChunk = "";
         let interim = "";
 
@@ -154,9 +156,14 @@ export function useWebSpeech(): UseWebSpeechReturn {
     recognitionRef.current = null;
     if (r) {
       try {
-        r.stop();
+        // `stop()` can still deliver a final `onresult` from audio already buffered (TTS echo).
+        r.abort();
       } catch {
-        /* already stopped */
+        try {
+          r.stop();
+        } catch {
+          /* already stopped */
+        }
       }
     }
     setIsListening(false);

@@ -64,8 +64,8 @@ const REVEAL_CHARS_PER_FRAME = 2;
 /** User live STT: balanced tick for smooth word-by-word display */
 const STT_WORD_MS = 16;  // ~60fps for smooth animation
 
-/** After TTS ends, keep Web Speech off briefly so room/speaker tail is not transcribed. */
-const POST_TTS_SPEECH_COOLDOWN_MS = 3000; // EXTENDED to 3 seconds for maximum echo protection
+/** Brief tail after TTS before restarting Web Speech (mic is already unblocked). */
+const POST_TTS_SPEECH_COOLDOWN_MS = 1200;
 
 const PLAY_ASSISTANT_VOICE_KEY = "scorpion_call_play_assistant_voice";
 
@@ -95,51 +95,22 @@ function normalizeUtterance(s: string): string {
 }
 
 /** True if the browser transcript is probably the assistant line played through speakers. */
-function utteranceLooksLikeTtsEcho(user: string, assistant: string, timeSinceAssistant: number): boolean {
+function utteranceLooksLikeTtsEcho(user: string, assistant: string): boolean {
   const u = normalizeUtterance(user);
   const a = normalizeUtterance(assistant);
   if (!u || !a) return false;
-
-  // NUCLEAR OPTION: Block ANY text that appears during/after assistant speaks
-  if (timeSinceAssistant < 3000) { // 3 seconds after assistant spoke
-    return true; // BLOCK EVERYTHING for 3 seconds after TTS
-  }
-
-  // Exact match - definitely echo
   if (u === a) return true;
-
-  // ANY overlap for short texts = echo (super aggressive)
-  if (u.length <= 10 || a.length <= 10) {
-    const overlapRatio = calculateOverlapRatio(u, a);
-    return overlapRatio >= 0.3; // 30% overlap for short texts
-  }
-
-  // Medium texts - be strict
-  if (u.length <= 20) {
-    const overlapRatio = calculateOverlapRatio(u, a);
-    return overlapRatio >= 0.25; // 25% overlap
-  }
-
-  // Long texts - moderate but still strict
-  const overlapRatio = calculateOverlapRatio(u, a);
-  return overlapRatio >= 0.2; // 20% overlap
-}
-
-function calculateOverlapRatio(user: string, assistant: string): number {
-  const uw = user.split(" ").filter(Boolean);
-  const aw = new Set(assistant.split(" ").filter(Boolean));
-
-  if (uw.length === 0 || aw.size === 0) return 0;
-
+  if (u.length >= 20 && a.includes(u)) return true;
+  if (a.length >= 20 && u.includes(a)) return true;
+  const uw = u.split(" ").filter(Boolean);
+  const aw = new Set(a.split(" ").filter(Boolean));
+  if (uw.length < 4 || aw.size < 4) return false;
   let inter = 0;
   for (const w of uw) {
     if (aw.has(w)) inter++;
   }
-
   const union = new Set([...uw, ...aw]).size;
-  if (union === 0) return 0;
-
-  return inter / union;
+  return union > 0 && inter / union >= 0.42;
 }
 
 function revealNextWordChunk(fullText: string, revealed: number): number {
@@ -176,14 +147,12 @@ export default function CallPage() {
   const [latency, setLatency] = useState<{ stt?: number; llm_first?: number; total?: number }>({});
   const llmStartAt = useRef<number | null>(null);
   const [muted, setMuted] = useState(false);
-  const [echoFreezeMode, setEchoFreezeMode] = useState(true); // HARD FREEZE echo blocking by default
   /** Piper → tab speakers. Default off: laptop speakers + Web Speech = echo. Headphones: turn on. */
   const [playAssistantVoice, setPlayAssistantVoice] = useState(readPlayAssistantVoicePref);
   const [startedAt, setStartedAt] = useState<number | null>(null);
   const [typing, setTyping] = useState("");
   const [micLevel, setMicLevel] = useState(0);
   const [aiLevel, setAILevel] = useState(0);
-  const [echoFilteredCount, setEchoFilteredCount] = useState(0); // Track echo filtering
   const [preload, setPreload] = useState<Record<WarmupKey, { status: PreloadState; ms?: number; err?: string }>>({
     llm: { status: "pending" },
     tts: { status: "pending" },
@@ -199,9 +168,11 @@ export default function CallPage() {
   const lastWebSpeechRef = useRef<string>("");
   /** Last finalized assistant text (for echo detection before send). */
   const lastAssistantTextRef = useRef<string>("");
-  const lastAssistantTimeRef = useRef<number>(0); // Track when assistant last spoke
-  const speechResumeAtRef = useRef(0);
-  const [speechGateEpoch, setSpeechGateEpoch] = useState(0);
+  /** True for a short window after TTS ends — mic + browser dictation stay off for speaker tail. */
+  const [postTtsSilence, setPostTtsSilence] = useState(false);
+  /** False while assistant audio is active — blocks late Web Speech `isFinal` callbacks. */
+  const speechResultsAllowedRef = useRef(true);
+  const lastAgentStateRef = useRef<AgentState>("idle");
 
   /** Show all messages including live STT - no more separate ugly live caption */
   const { threadMessages } = useMemo(() => {
@@ -289,99 +260,58 @@ export default function CallPage() {
   const { isSupported: speechSupported, start: speechStart, stop: speechStop, reset: speechReset, setOnFinalPhrase } =
     webSpeech;
 
-  // Mic dictation: AGGRESSIVELY off during TTS and for extended cooldown (speaker tail / room echo).
+  // Browser dictation: off while assistant talks OR post-TTS tail (Web Speech is NOT our getUserMedia mute).
   useEffect(() => {
     if (state !== "live" || !speechSupported) {
       speechStop();
       return;
     }
-    // COMPLETELY BLOCK speech while assistant is speaking
-    if (agentState === "speaking") {
+    if (agentState === "speaking" || postTtsSilence) {
       speechStop();
       return;
     }
-
-    // EXTENDED COOLDOWN: Block for longer after assistant stops
-    const waitMs = speechResumeAtRef.current - Date.now();
-    if (waitMs > 0) {
-      speechStop();
-      const t = window.setTimeout(() => setSpeechGateEpoch((n) => n + 1), waitMs);
-      return () => window.clearTimeout(t);
-    }
+    speechResultsAllowedRef.current = true;
     speechStart();
     return () => {
       speechStop();
     };
-  }, [state, agentState, speechSupported, speechStart, speechStop, speechGateEpoch]);
+  }, [state, agentState, speechSupported, speechStart, speechStop, postTtsSilence]);
+
+  useEffect(() => {
+    if (state !== "live") setPostTtsSilence(false);
+  }, [state]);
 
   useEffect(() => {
     transport.current?.setAssistantSpeakerOutput(playAssistantVoice);
   }, [playAssistantVoice]);
 
-  // Disable the capture device while the assistant is speaking so speakers cannot feed the mic.
+  // Hardware mic used for the call transport: off while assistant speaks OR post-TTS tail.
   useEffect(() => {
     if (state !== "live") {
       transport.current?.setTtsMicSuppress(false);
       return;
     }
-    transport.current?.setTtsMicSuppress(agentState === "speaking");
+    const suppress = agentState === "speaking" || postTtsSilence;
+    transport.current?.setTtsMicSuppress(suppress);
     return () => {
       transport.current?.setTtsMicSuppress(false);
     };
-  }, [state, agentState]);
+  }, [state, agentState, postTtsSilence]);
 
   // Each Web Speech final phrase → backend (was broken: ref compared after it was overwritten).
   useEffect(() => {
     setOnFinalPhrase((phrase) => {
       const t = phrase.trim();
-
-      // NUCLEAR FREEZE: Completely block until manually released
-      if (echoFreezeMode) {
-        // Show user that echo protection is active
-        pushNotice("echo-freeze", "Echo protection active - use text input or headphones", "warn");
-        return; // COMPLETELY BLOCK ALL SPEECH
-      }
-
-      // NUCLEAR: Block everything during cooldown period
-      const timeSinceAssistant = Date.now() - lastAssistantTimeRef.current;
-      if (timeSinceAssistant < 4000) { // 4 seconds after assistant spoke
-        lastWebSpeechRef.current = "";
+      if (!t || !transport.current) return;
+      if (!speechResultsAllowedRef.current) {
         speechReset();
-        setEchoFilteredCount(prev => prev + 1);
-        return; // COMPLETELY BLOCK during cooldown
-      }
-
-      // Very short texts are often noise/echo artifacts
-      if (!t || t.length < 3 || !transport.current) return;
-
-      // Check against echo with aggressive thresholds
-      if (utteranceLooksLikeTtsEcho(t, lastAssistantTextRef.current, timeSinceAssistant)) {
-        lastWebSpeechRef.current = "";
-        speechReset();
-        setEchoFilteredCount(prev => prev + 1); // Track filtered echoes
-        // Show user notice about echo filtering
-        pushNotice("echo", "Filtered echo (assistant's voice was detected)", "warn");
         return;
       }
 
-      // Additional protection: reject very repetitive phrases (common in echo loops)
-      const recentUserTexts = messages
-        .filter(m => m.speaker === "user" && !m.partial)
-        .slice(-3)
-        .map(m => normalizeUtterance(m.fullText));
-
-      if (recentUserTexts.length >= 2) {
-        const isRepetitive = recentUserTexts.every(
-          recentText => normalizeUtterance(t) === recentText ||
-                       (t.length > 5 && recentText.includes(t))
-        );
-        if (isRepetitive) {
-          lastWebSpeechRef.current = "";
-          speechReset();
-          setEchoFilteredCount(prev => prev + 1);
-          pushNotice("repetitive", "Filtered repetitive text (possible echo)", "warn");
-          return;
-        }
+      if (utteranceLooksLikeTtsEcho(t, lastAssistantTextRef.current)) {
+        lastWebSpeechRef.current = "";
+        speechReset();
+        return;
       }
 
       transport.current.sendText(t);
@@ -404,11 +334,12 @@ export default function CallPage() {
       speechReset();
     });
     return () => setOnFinalPhrase(null);
-  }, [setOnFinalPhrase, speechReset, messages, echoFreezeMode]);
+  }, [setOnFinalPhrase, speechReset]);
 
   // Sync Web Speech API results with chat messages
   useEffect(() => {
     if (state !== "live") return;
+    if (agentState === "speaking" || postTtsSilence) return;
 
     const combinedText = webSpeech.transcript + " " + webSpeech.interimTranscript;
     const trimmedText = combinedText.trim();
@@ -449,7 +380,7 @@ export default function CallPage() {
         },
       ];
     });
-  }, [webSpeech.transcript, webSpeech.interimTranscript, state]);
+  }, [webSpeech.transcript, webSpeech.interimTranscript, state, agentState, postTtsSilence]);
 
   // Cleanup: remove empty bubbles after reasonable timeout
   useEffect(() => {
@@ -484,12 +415,15 @@ export default function CallPage() {
     if (!client) return;
     setMessages([]);
     lastAssistantTextRef.current = "";
+    setPostTtsSilence(false);
+    speechResultsAllowedRef.current = true;
     setActions([]);
     setNotices([]);
     setLatency({});
     setAgentState("idle");
     setPendingLLMRoute(null);
     llmStartAt.current = null;
+    lastAgentStateRef.current = "idle";
 
     // ---- Phase 1: warmup every backing service in parallel. This makes the
     // first turn feel instant (LLM kv-cache hot, piper paged into RAM).
@@ -551,11 +485,40 @@ export default function CallPage() {
     setState("ended");
   };
 
+  const forceInputMuteForAssistant = () => {
+    speechResultsAllowedRef.current = false;
+    transport.current?.setTtsMicSuppress(true);
+    speechStop();
+    speechReset();
+    lastWebSpeechRef.current = "";
+    setPostTtsSilence(false);
+  };
+
+  const releaseInputMuteAfterAssistant = () => {
+    speechResultsAllowedRef.current = false;
+    speechStop();
+    speechReset();
+    lastWebSpeechRef.current = "";
+    setPostTtsSilence(true);
+    window.setTimeout(() => {
+      setPostTtsSilence(false);
+    }, POST_TTS_SPEECH_COOLDOWN_MS);
+  };
+
   const onEvent = (e: { kind: string; payload?: any }) => {
     switch (e.kind) {
       case "state": {
         const s = (e.payload?.state || "idle") as AgentState;
+        const prev = lastAgentStateRef.current;
+        lastAgentStateRef.current = s;
         setAgentState(s);
+        if (s === "speaking") {
+          // Fallback hard-mute even if tts_start is delayed/missed.
+          forceInputMuteForAssistant();
+        } else if (s === "listening" && prev === "speaking") {
+          // Fallback release path even if tts_end is delayed/missed.
+          releaseInputMuteAfterAssistant();
+        }
         if (s === "listening" || s === "idle") {
           setMessages((m) => dropPending(m));
           setPendingLLMRoute(null);
@@ -600,7 +563,7 @@ export default function CallPage() {
           const prevAssistant = [...next.slice(0, -1)].reverse().find((x) => x.speaker === "assistant");
           const drop =
             (filtered && last.fullText.trim().toLowerCase() === filtered.toLowerCase()) ||
-            Boolean(prevAssistant && utteranceLooksLikeTtsEcho(last.fullText, prevAssistant.fullText, 99999)); // Use large time for message display check
+            Boolean(prevAssistant && utteranceLooksLikeTtsEcho(last.fullText, prevAssistant.fullText));
           return drop ? next.slice(0, -1) : next;
         });
         break;
@@ -670,17 +633,19 @@ export default function CallPage() {
       case "barge_in":
         transport.current?.muteIncomingTTS();
         break;
-      case "tts_start":
+      case "tts_start": {
+        // Same tick as server audio: Web Speech does NOT follow our getUserMedia mute — stop it here.
+        forceInputMuteForAssistant();
         transport.current?.unmuteIncomingTTS();
         setPendingLLMRoute(null);
         setAgentState("speaking");
         break;
-      case "tts_end":
+      }
+      case "tts_end": {
+        releaseInputMuteAfterAssistant();
         setAgentState("listening");
-        lastAssistantTimeRef.current = Date.now(); // Track when assistant finished speaking
-        speechResumeAtRef.current = Date.now() + POST_TTS_SPEECH_COOLDOWN_MS;
-        setSpeechGateEpoch((n) => n + 1);
         break;
+      }
       case "stt_start":
         // Stay on listening — "thinking" is only while the LLM runs (after STT).
         break;
@@ -722,6 +687,9 @@ export default function CallPage() {
 
   const inPreload = preloading && state !== "live";
   const isLive = state === "live";
+  /** Web Speech should only be "live" when we intentionally started it (not during TTS / tail). */
+  const dictationArmed = state === "live" && speechSupported && agentState !== "speaking" && !postTtsSilence;
+  const speechUiListening = dictationArmed && webSpeech.isListening;
 
   return (
     <motion.div
@@ -837,21 +805,6 @@ export default function CallPage() {
                   >
                     <PhoneOff size={17} />
                   </button>
-
-                  {/* Echo Protection Toggle */}
-                  <button
-                    type="button"
-                    onClick={() => setEchoFreezeMode(!echoFreezeMode)}
-                    className={clsx(
-                      "h-11 w-11 rounded-full grid place-items-center shrink-0 transition shadow-soft border",
-                      echoFreezeMode
-                        ? "bg-bad/10 text-bad border-bad/30 hover:bg-bad/20"
-                        : "bg-ok/10 text-ok border-ok/30 hover:bg-ok/20",
-                    )}
-                    title={echoFreezeMode ? "Echo Protection: ON (speech blocked)" : "Echo Protection: OFF"}
-                  >
-                    <AlertTriangle size={17} />
-                  </button>
                 </>
               )}
               <input
@@ -884,7 +837,7 @@ export default function CallPage() {
                   aiLevel={aiLevel}
                   muted={muted}
                   pendingLLMRoute={pendingLLMRoute}
-                  speechListening={webSpeech.isListening}
+                  speechListening={speechUiListening}
                 />
               </div>
             )}
@@ -901,57 +854,27 @@ export default function CallPage() {
                     <div
                       className={clsx(
                         "h-2 w-2 rounded-full",
-                        agentState === "speaking"
-                          ? "bg-ink-300"
-                          : webSpeech.isListening
-                            ? "bg-ok animate-pulse"
-                            : "bg-ink-300",
+                        speechUiListening ? "bg-ok animate-pulse" : "bg-ink-300",
                       )}
                     />
                     <span className="text-ink-600">
                       {agentState === "speaking"
-                        ? "Blocked (assistant speaking)"
-                        : webSpeech.isListening
-                          ? "Listening for you"
-                          : "Starting…"}
+                        ? "Off (assistant speaking)"
+                        : postTtsSilence
+                          ? "Off (post-playback tail)"
+                          : speechUiListening
+                            ? "Listening for you"
+                            : dictationArmed
+                              ? "Starting…"
+                              : "Off"}
                     </span>
                   </div>
-
-                  {/* Echo filtering indicator */}
-                  {echoFreezeMode && (
-                    <div className="flex items-center gap-2 mb-2 p-2 bg-red-50 rounded-lg border border-red-200">
-                      <AlertTriangle size={12} className="text-red-600" />
-                      <span className="text-red-700 font-medium">
-                        Echo Protection: ON (speech blocked)
-                      </span>
-                    </div>
-                  )}
-
-                  {!echoFreezeMode && echoFilteredCount > 0 && (
-                    <div className="flex items-center gap-2 mb-2">
-                      <AlertTriangle size={12} className="text-warn" />
-                      <span className="text-ink-600">
-                        Filtered {echoFilteredCount} echo{echoFilteredCount !== 1 ? "es" : ""}
-                      </span>
-                    </div>
-                  )}
 
                   {webSpeech.error && (
                     <div className="text-warn text-[11px] mt-1">Error: {webSpeech.error}</div>
                   )}
 
-                  {/* Headphone recommendation */}
-                  <div className="mt-3 p-2 bg-blue-50 rounded-lg border border-blue-100">
-                    <div className="flex items-start gap-2">
-                      <Volume2 size={12} className="text-blue-600 mt-0.5 shrink-0" />
-                      <div className="text-[11px] text-ink-700 leading-tight">
-                        <strong className="text-blue-800">Best experience:</strong> Use headphones or move
-                        speakers away from mic to prevent the assistant from hearing itself.
-                      </div>
-                    </div>
-                  </div>
-
-                  {state === "live" && agentState !== "speaking" && webSpeech.isListening && (
+                  {state === "live" && speechUiListening && (
                     <div className="text-ink-500 text-[11px] mt-1 space-y-1">
                       <p>Pause after a phrase to send; or type in the bar below.</p>
                       {!playAssistantVoice && (
