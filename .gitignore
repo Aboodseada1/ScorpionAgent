@@ -1,0 +1,27 @@
+# build artifacts
+bin/
+/agent
+web/dist/
+web/node_modules/
+
+# Local LLM weights (huge binaries — never push through normal git; use Git LFS or host separately)
+*.gguf
+models/
+
+# runtime
+.env
+data/app.sqlite3
+data/app.sqlite3-shm
+data/app.sqlite3-wal
+data/runtime_overrides.json
+data/calls/
+data/intel/
+data/kb/
+data/*.json
+logs/
+
+# editors
+.vscode/
+.idea/
+*.swp
+.DS_Store

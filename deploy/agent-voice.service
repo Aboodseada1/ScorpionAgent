@@ -1,0 +1,21 @@
+[Unit]
+Description=Scorpion Voice SDR Agent (Go)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/var/www/agent.scorpion.codes
+EnvironmentFile=-/var/www/agent.scorpion.codes/.env
+ExecStart=/var/www/agent.scorpion.codes/bin/agent
+Restart=on-failure
+RestartSec=3
+User=root
+Group=root
+StandardOutput=journal
+StandardError=journal
+# Ensure piper is reachable
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=multi-user.target

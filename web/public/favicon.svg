@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="Voice agent">
+  <defs>
+    <linearGradient id="a" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#22d3ee"/>
+      <stop offset="100%" stop-color="#0284c7"/>
+    </linearGradient>
+  </defs>
+  <rect width="32" height="32" rx="8" fill="#0c1222"/>
+  <rect x="8.5" y="11" width="3.5" height="12" rx="1" fill="url(#a)"/>
+  <rect x="14.25" y="7" width="3.5" height="20" rx="1" fill="url(#a)"/>
+  <rect x="20" y="9" width="3.5" height="16" rx="1" fill="url(#a)"/>
+</svg>
