@@ -318,6 +318,18 @@ export default function CallPage() {
     transport.current?.setAssistantSpeakerOutput(playAssistantVoice);
   }, [playAssistantVoice]);
 
+  // Disable the capture device while the assistant is speaking so speakers cannot feed the mic.
+  useEffect(() => {
+    if (state !== "live") {
+      transport.current?.setTtsMicSuppress(false);
+      return;
+    }
+    transport.current?.setTtsMicSuppress(agentState === "speaking");
+    return () => {
+      transport.current?.setTtsMicSuppress(false);
+    };
+  }, [state, agentState]);
+
   // Each Web Speech final phrase → backend (was broken: ref compared after it was overwritten).
   useEffect(() => {
     setOnFinalPhrase((phrase) => {

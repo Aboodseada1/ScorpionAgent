@@ -42,6 +42,10 @@ export class CallTransport {
   private assistantSpeakersOn = false;
   /** After `muteIncomingTTS`, restore only when this is cleared in `unmuteIncomingTTS`. */
   private bargeDucked = false;
+  /** User clicked mute (want mic off until they unmute). */
+  private userMicMuted = false;
+  /** Mic off while assistant TTS is playing — stops speaker→mic bleed on laptops. */
+  private ttsMicSuppress = false;
   private disposed = false;
   private announced: "idle" | "connecting" | "live" | "ended" = "idle";
 
@@ -62,6 +66,8 @@ export class CallTransport {
     this.setState("connecting");
     this.assistantSpeakersOn = options?.playAssistantAudio ?? false;
     this.bargeDucked = false;
+    this.userMicMuted = false;
+    this.ttsMicSuppress = false;
     // 1) get mic with AEC+NS+AGC on
     this.micStream = await navigator.mediaDevices.getUserMedia({
       audio: {
@@ -72,6 +78,7 @@ export class CallTransport {
       },
       video: false,
     });
+    this.applyMicTrackEnabled();
 
     // 2) build AudioContext and worklet to downsample mic to 16 kHz PCM16
     this.audioCtx = new AudioContext({ sampleRate: 48000 });
@@ -139,10 +146,27 @@ export class CallTransport {
     try { this.ws.send(JSON.stringify({ type: "text_turn", text })); } catch { /* noop */ }
   }
 
-  setMuted(muted: boolean): void {
-    this.micStream?.getAudioTracks().forEach((t) => {
-      t.enabled = !muted;
+  private applyMicTrackEnabled(): void {
+    if (!this.micStream) return;
+    const on = !this.userMicMuted && !this.ttsMicSuppress;
+    this.micStream.getAudioTracks().forEach((t) => {
+      t.enabled = on;
     });
+  }
+
+  /** User mute: mic stays off until unmuted (combined with TTS suppress). */
+  setMuted(muted: boolean): void {
+    this.userMicMuted = muted;
+    this.applyMicTrackEnabled();
+  }
+
+  /**
+   * When true, hardware mic tracks are disabled (no PCM to server / graph).
+   * Call with true for the whole time the assistant is speaking.
+   */
+  setTtsMicSuppress(suppress: boolean): void {
+    this.ttsMicSuppress = suppress;
+    this.applyMicTrackEnabled();
   }
 
   /** Route Piper output to the tab speakers (off by default to avoid mic echo with Web Speech). */
