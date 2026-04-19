@@ -15,10 +15,12 @@ import (
 	"time"
 
 	"scorpion/agent/internal/actions"
+	"scorpion/agent/internal/audio"
 	"scorpion/agent/internal/config"
 	"scorpion/agent/internal/kb"
 	"scorpion/agent/internal/llm"
 	"scorpion/agent/internal/memory"
+	"scorpion/agent/internal/stt"
 	"scorpion/agent/internal/tts"
 	"scorpion/agent/internal/vad"
 )
@@ -58,7 +60,7 @@ type Deps struct {
 	Store *config.Store
 	Mem   *memory.DB
 	LLM   *llm.Client
-	// STT   stt.Client // Removed - using Chrome Web Speech API
+	STT   stt.Client
 	TTS   *tts.Pool
 	KB    *kb.Store
 }
@@ -104,7 +106,10 @@ func New(id, clientID, convID string, deps *Deps) *Session {
 		self: NewSelfFilter(cfg.SelfFilterNGram),
 	}
 	s.state.Store(StateIdle)
-	// VAD callbacks removed - using Chrome Web Speech API directly
+	s.vad.OnVoiceStart = s.onVoiceStart
+	if deps.STT != nil {
+		s.vad.OnUtterance = s.onUtterance
+	}
 	return s
 }
 
@@ -151,7 +156,7 @@ func (s *Session) onPartialAudio(pcm16k []float32) {
 	if s.State() == StateEnded {
 		return
 	}
-	
+
 	s.muPartial.Lock()
 	if s.partialCancel != nil {
 		s.partialCancel()
@@ -160,7 +165,62 @@ func (s *Session) onPartialAudio(pcm16k []float32) {
 	s.partialCancel = cancel
 	s.muPartial.Unlock()
 
-	// Removed partial STT - using Chrome Web Speech API for real-time transcription
+	// Optional: server partial STT was removed; live captions use browser path only.
+	_ = pcm16k
+}
+
+func (s *Session) onUtterance(pcm16k []float32) {
+	if s.State() == StateEnded || s.Deps.STT == nil {
+		return
+	}
+	epoch := s.speechEpoch.Load()
+	pcm := audio.TrimTrailingSilence(pcm16k, 320, 4000)
+	if len(pcm) < 800 {
+		s.emit("utterance_empty", map[string]any{})
+		return
+	}
+	go s.finishUtterance(epoch, pcm)
+}
+
+func (s *Session) finishUtterance(epoch uint64, pcm []float32) {
+	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Second)
+	defer cancel()
+	t0 := time.Now()
+	s.emit("stt_start", map[string]any{})
+	if epoch != s.speechEpoch.Load() {
+		return
+	}
+	res, err := s.Deps.STT.Transcribe(ctx, pcm)
+	if epoch != s.speechEpoch.Load() {
+		return
+	}
+	latencyMs := int(time.Since(t0).Milliseconds())
+	if err != nil {
+		slog.Warn("stt transcribe", "err", err)
+		s.emit("error", map[string]any{"stage": "stt", "err": err.Error()})
+		s.emit("utterance_empty", map[string]any{})
+		return
+	}
+	if res == nil {
+		s.emit("utterance_empty", map[string]any{})
+		return
+	}
+	if res.Latency > 0 {
+		latencyMs = int(res.Latency)
+	}
+	text := strings.TrimSpace(res.Text)
+	if text == "" {
+		s.emit("utterance_empty", map[string]any{})
+		return
+	}
+	if s.self.IsSelf(text) {
+		s.emit("self_filtered", map[string]any{"text": text})
+		return
+	}
+	nowMs := time.Now().UnixMilli()
+	_ = s.Deps.Mem.AppendTurn(&memory.Turn{ConvID: s.ConvID, Speaker: "user", Text: text, StartMs: nowMs, EndMs: nowMs})
+	s.emit("transcript", map[string]any{"speaker": "user", "text": text, "latency_ms": latencyMs})
+	go s.runTurn(context.Background(), text)
 }
 
 // HandleTextTurn processes a text-only user turn from Chrome Web Speech API.
@@ -442,6 +502,7 @@ func (s *Session) End() {
 		s.turnCancel()
 	}
 	s.mu.Unlock()
+	s.vad.Reset()
 	s.setState(StateEnded)
 	_ = s.Deps.Mem.EndConversation(s.ConvID, summarize(s.history))
 	go s.runExtraction(context.Background())

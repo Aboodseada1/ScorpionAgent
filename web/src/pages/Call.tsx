@@ -159,11 +159,17 @@ export default function CallPage() {
     stt: { status: "ok" },
   });
   const [preloading, setPreloading] = useState(false);
-  // Chrome Web Speech API is now the only STT method
+  /** When true, mic audio goes to the server for Whisper + VAD (no browser dictation). */
+  const [useServerStt, setUseServerStt] = useState(false);
+  const useServerSttRef = useRef(false);
   const transport = useRef<CallTransport | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
-  // Chrome Web Speech API integration (primary STT method)
+  useEffect(() => {
+    useServerSttRef.current = useServerStt;
+  }, [useServerStt]);
+
+  // Chrome Web Speech API (fallback when server Whisper is unavailable)
   const webSpeech = useWebSpeech();
   const lastWebSpeechRef = useRef<string>("");
   /** Last finalized assistant text (for echo detection before send). */
@@ -266,6 +272,10 @@ export default function CallPage() {
 
   // Browser dictation: off while assistant talks OR post-TTS tail (Web Speech is NOT our getUserMedia mute).
   useEffect(() => {
+    if (useServerStt) {
+      speechStop();
+      return;
+    }
     if (state !== "live" || !speechSupported) {
       speechStop();
       return;
@@ -279,7 +289,7 @@ export default function CallPage() {
     return () => {
       speechStop();
     };
-  }, [state, assistantSpeakingNow, speechSupported, speechStart, speechStop, postTtsSilence]);
+  }, [state, useServerStt, assistantSpeakingNow, speechSupported, speechStart, speechStop, postTtsSilence]);
 
   // Track real assistant playback from output level in case state/events lag.
   useEffect(() => {
@@ -311,6 +321,12 @@ export default function CallPage() {
   }, [state]);
 
   useEffect(() => {
+    if (state === "ended" || state === "idle") {
+      setUseServerStt(false);
+    }
+  }, [state]);
+
+  useEffect(() => {
     transport.current?.setAssistantSpeakerOutput(playAssistantVoice);
   }, [playAssistantVoice]);
 
@@ -320,16 +336,21 @@ export default function CallPage() {
       transport.current?.setTtsMicSuppress(false);
       return;
     }
-    const suppress = assistantSpeakingNow || postTtsSilence;
+    // Server Whisper uses VAD + TTS reference subtraction — keep mic streaming during playback.
+    const suppress = !useServerStt && (assistantSpeakingNow || postTtsSilence);
     transport.current?.setTtsMicSuppress(suppress);
     return () => {
       transport.current?.setTtsMicSuppress(false);
     };
-  }, [state, assistantSpeakingNow, postTtsSilence]);
+  }, [state, useServerStt, assistantSpeakingNow, postTtsSilence]);
 
   // Each Web Speech final phrase → backend (was broken: ref compared after it was overwritten).
   useEffect(() => {
     setOnFinalPhrase((phrase) => {
+      if (useServerSttRef.current) {
+        speechReset();
+        return;
+      }
       const t = phrase.trim();
       if (!t || !transport.current) return;
       if (!speechResultsAllowedRef.current) {
@@ -368,7 +389,7 @@ export default function CallPage() {
   // Sync Web Speech API results with chat messages
   useEffect(() => {
     if (state !== "live") return;
-    if (assistantSpeakingNow || postTtsSilence) return;
+    if (useServerStt || assistantSpeakingNow || postTtsSilence) return;
 
     const combinedText = webSpeech.transcript + " " + webSpeech.interimTranscript;
     const trimmedText = combinedText.trim();
@@ -409,7 +430,7 @@ export default function CallPage() {
         },
       ];
     });
-  }, [webSpeech.transcript, webSpeech.interimTranscript, state, assistantSpeakingNow, postTtsSilence]);
+  }, [webSpeech.transcript, webSpeech.interimTranscript, state, useServerStt, assistantSpeakingNow, postTtsSilence]);
 
   // Cleanup: remove empty bubbles after reasonable timeout
   useEffect(() => {
@@ -442,6 +463,7 @@ export default function CallPage() {
 
   const start = async () => {
     if (!client) return;
+    setUseServerStt(false);
     setMessages([]);
     lastAssistantTextRef.current = "";
     setPostTtsSilence(false);
@@ -457,17 +479,22 @@ export default function CallPage() {
     // ---- Phase 1: warmup every backing service in parallel. This makes the
     // first turn feel instant (LLM kv-cache hot, piper paged into RAM).
     setPreloading(true);
-    setPreload({ llm: { status: "running" }, tts: { status: "running" }, stt: { status: "ok" } });
+    setPreload({ llm: { status: "running" }, tts: { status: "running" }, stt: { status: "running" } });
     try {
       const res = await api.warmupSession();
-      const next: typeof preload = { llm: { status: "pending" }, tts: { status: "pending" }, stt: { status: "ok" } };
-      (["llm", "tts"] as const).forEach((k) => {
+      const next: typeof preload = { llm: { status: "pending" }, tts: { status: "pending" }, stt: { status: "pending" } };
+      (["llm", "tts", "stt"] as const).forEach((k) => {
         const s = res.status[k];
         if (!s) return;
         next[k] = { status: s.ok ? "ok" : "failed", ms: s.ms, err: s.err };
       });
       setPreload(next);
-      if (!res.ok) {
+      const coreOk = Boolean(res.status.llm?.ok && res.status.tts?.ok);
+      setUseServerStt(coreOk && Boolean(res.status.stt?.ok));
+      if (coreOk && !res.status.stt?.ok) {
+        pushNotice("stt", "Whisper server unavailable — using browser speech for this call.", "warn");
+      }
+      if (!coreOk) {
         pushNotice(
           "warmup",
           Object.entries(res.status)
@@ -516,7 +543,9 @@ export default function CallPage() {
 
   const forceInputMuteForAssistant = () => {
     speechResultsAllowedRef.current = false;
-    transport.current?.setTtsMicSuppress(true);
+    if (!useServerSttRef.current) {
+      transport.current?.setTtsMicSuppress(true);
+    }
     speechStop();
     speechReset();
     lastWebSpeechRef.current = "";
@@ -717,7 +746,8 @@ export default function CallPage() {
   const inPreload = preloading && state !== "live";
   const isLive = state === "live";
   /** Web Speech should only be "live" when we intentionally started it (not during TTS / tail). */
-  const dictationArmed = state === "live" && speechSupported && !assistantSpeakingNow && !postTtsSilence;
+  const dictationArmed =
+    state === "live" && !useServerStt && speechSupported && !assistantSpeakingNow && !postTtsSilence;
   const speechUiListening = dictationArmed && webSpeech.isListening;
 
   return (
@@ -730,7 +760,7 @@ export default function CallPage() {
       
 
       {inPreload ? (
-        <PreloadScreen preload={preload} />
+        <PreloadScreen preload={preload} serverStt={useServerStt} />
       ) : (
         <div className="flex-1 min-h-0 flex flex-col lg:flex-row overflow-hidden">
           <div className="flex-1 min-h-0 flex flex-col min-w-0 lg:border-r border-ink-100/80 bg-paper/40">
@@ -872,8 +902,25 @@ export default function CallPage() {
             )}
 
             <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain p-4 md:p-5 space-y-4">
-              {/* Chrome Web Speech API Status - Always Enabled */}
-              {webSpeech.isSupported && (
+              {useServerStt && (
+                <div className="rounded-2xl border border-ink-100 bg-paper/80 p-4 text-xs">
+                  <div className="flex items-center gap-2 text-sm font-display text-ink-600 mb-2">
+                    <Mic2 size={16} className="text-ok" />
+                    Server speech (Whisper)
+                  </div>
+                  <div className="flex items-center gap-2 mb-2">
+                    <div className={clsx("h-2 w-2 rounded-full", state === "live" ? "bg-ok animate-pulse" : "bg-ink-300")} />
+                    <span className="text-ink-600">
+                      {state === "live" ? "Mic streamed to server · VAD + echo gate" : "Off"}
+                    </span>
+                  </div>
+                  <p className="text-ink-500 text-[11px] leading-relaxed">
+                    After you pause, the server transcribes the utterance (Whisper). The tab does not use browser
+                    dictation, so the assistant is much less likely to “hear” its own voice.
+                  </p>
+                </div>
+              )}
+              {!useServerStt && webSpeech.isSupported && (
                 <div className="rounded-2xl border border-ink-100 bg-paper/80 p-4 text-xs">
                   <div className="flex items-center gap-2 text-sm font-display text-ink-600 mb-2">
                     <Mic2 size={16} className="text-ok" />
@@ -1001,11 +1048,21 @@ export default function CallPage() {
   );
 }
 
-function PreloadScreen({ preload }: { preload: Record<WarmupKey, { status: PreloadState; ms?: number; err?: string }> }) {
+function PreloadScreen({
+  preload,
+  serverStt,
+}: {
+  preload: Record<WarmupKey, { status: PreloadState; ms?: number; err?: string }>;
+  serverStt: boolean;
+}) {
   const steps: { key: WarmupKey; label: string; hint: string }[] = [
     { key: "llm", label: "Language model", hint: "KV cache warm" },
     { key: "tts", label: "Voice engine", hint: "Piper" },
-    { key: "stt", label: "Transcriber", hint: "Web Speech (this browser)" },
+    {
+      key: "stt",
+      label: "Transcriber",
+      hint: serverStt ? "Whisper (server, VAD + echo gate)" : "Web Speech (this browser)",
+    },
   ];
   return (
     <motion.div

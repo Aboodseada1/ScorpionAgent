@@ -17,6 +17,7 @@ import (
 	"scorpion/agent/internal/llm"
 	"scorpion/agent/internal/llmmodels"
 	"scorpion/agent/internal/memory"
+	"scorpion/agent/internal/stt"
 	"scorpion/agent/internal/sysmetrics"
 	"scorpion/agent/internal/tts"
 	"scorpion/agent/internal/voices"
@@ -26,7 +27,7 @@ type Deps struct {
 	Store     *config.Store
 	Mem       *memory.DB
 	LLM       *llm.Client
-	// STT       stt.Client // Removed - using Chrome Web Speech API
+	STT       stt.Client
 	TTS       *tts.Pool
 	KB        *kb.Store
 	Voices    *voices.Store

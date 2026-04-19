@@ -113,7 +113,7 @@ func handleSessionWarmup(d *Deps) http.HandlerFunc {
 			ms     int64
 			errMsg string
 		}
-		results := make(chan result, 2) // Removed STT
+		results := make(chan result, 3)
 
 		// LLM: fire a 1-token generate to load the model into kv-cache.
 		go func() {
@@ -135,22 +135,38 @@ func handleSessionWarmup(d *Deps) http.HandlerFunc {
 			}
 			results <- res
 		}()
-		// STT removed - using Chrome Web Speech API
+		// STT: whisper.cpp HTTP (optional — call still starts if this fails).
+		go func() {
+			start := time.Now()
+			if d.STT == nil {
+				results <- result{name: "stt", ok: false, ms: 0, errMsg: "not configured"}
+				return
+			}
+			err := d.STT.Ping(ctx)
+			res := result{name: "stt", ok: err == nil, ms: time.Since(start).Milliseconds()}
+			if err != nil {
+				res.errMsg = err.Error()
+			}
+			results <- res
+		}()
 
 		status := map[string]any{}
-		allOK := true
-		for i := 0; i < 2; i++ { // Now only 2 results (LLM + TTS)
+		coreOK := true
+		for i := 0; i < 3; i++ {
 			res := <-results
 			entry := map[string]any{"ok": res.ok, "ms": res.ms}
 			if res.errMsg != "" {
 				entry["err"] = res.errMsg
 			}
 			status[res.name] = entry
+			if res.name == "stt" {
+				continue
+			}
 			if !res.ok {
-				allOK = false
+				coreOK = false
 			}
 		}
-		writeJSON(w, 200, map[string]any{"ok": allOK, "status": status})
+		writeJSON(w, 200, map[string]any{"ok": coreOK, "status": status})
 	}
 }
 
@@ -166,8 +182,7 @@ func handleSessionStart(d *Deps) http.HandlerFunc {
 			return
 		}
 		sess := session.New(conv.ID, body.ClientID, conv.ID, &session.Deps{
-			Store: d.Store, Mem: d.Mem, LLM: d.LLM, TTS: d.TTS, KB: d.KB,
-			// STT: d.STT, // Removed - using Chrome Web Speech API
+			Store: d.Store, Mem: d.Mem, LLM: d.LLM, STT: d.STT, TTS: d.TTS, KB: d.KB,
 		})
 		tr := &Transport{ID: conv.ID}
 		entry := &sessionEntry{sess: sess, tr: tr}

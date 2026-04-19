@@ -21,6 +21,7 @@ import (
 	"scorpion/agent/internal/llm"
 	"scorpion/agent/internal/llmmodels"
 	"scorpion/agent/internal/memory"
+	"scorpion/agent/internal/stt"
 	"scorpion/agent/internal/sysmetrics"
 	"scorpion/agent/internal/tts"
 	"scorpion/agent/internal/voices"
@@ -40,7 +41,7 @@ func main() {
 	defer mem.Close()
 
 	llmClient := llm.NewClient(store)
-	// STT removed - using Chrome Web Speech API only
+	sttClient := stt.NewWhisperHTTP(store)
 	ttsPool := tts.NewPool(store)
 	kbStore := kb.New(mem, store)
 
@@ -80,7 +81,7 @@ func main() {
 		Store:     store,
 		Mem:       mem,
 		LLM:       llmClient,
-		// STT:       nil, // Removed - using Chrome Web Speech API
+		STT:       sttClient,
 		TTS:       ttsPool,
 		KB:        kbStore,
 		Voices:    voiceStore,
