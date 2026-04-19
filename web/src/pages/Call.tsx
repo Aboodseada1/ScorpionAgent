@@ -170,9 +170,12 @@ export default function CallPage() {
   const lastAssistantTextRef = useRef<string>("");
   /** True for a short window after TTS ends — mic + browser dictation stay off for speaker tail. */
   const [postTtsSilence, setPostTtsSilence] = useState(false);
+  /** Real assistant audio activity from output level (fallback when server state/events lag). */
+  const [assistantAudioActive, setAssistantAudioActive] = useState(false);
   /** False while assistant audio is active — blocks late Web Speech `isFinal` callbacks. */
   const speechResultsAllowedRef = useRef(true);
   const lastAgentStateRef = useRef<AgentState>("idle");
+  const assistantAudioTailTimerRef = useRef<number | null>(null);
 
   /** Show all messages including live STT - no more separate ugly live caption */
   const { threadMessages } = useMemo(() => {
@@ -259,6 +262,7 @@ export default function CallPage() {
 
   const { isSupported: speechSupported, start: speechStart, stop: speechStop, reset: speechReset, setOnFinalPhrase } =
     webSpeech;
+  const assistantSpeakingNow = agentState === "speaking" || assistantAudioActive;
 
   // Browser dictation: off while assistant talks OR post-TTS tail (Web Speech is NOT our getUserMedia mute).
   useEffect(() => {
@@ -266,7 +270,7 @@ export default function CallPage() {
       speechStop();
       return;
     }
-    if (agentState === "speaking" || postTtsSilence) {
+    if (assistantSpeakingNow || postTtsSilence) {
       speechStop();
       return;
     }
@@ -275,7 +279,32 @@ export default function CallPage() {
     return () => {
       speechStop();
     };
-  }, [state, agentState, speechSupported, speechStart, speechStop, postTtsSilence]);
+  }, [state, assistantSpeakingNow, speechSupported, speechStart, speechStop, postTtsSilence]);
+
+  // Track real assistant playback from output level in case state/events lag.
+  useEffect(() => {
+    if (state !== "live") {
+      setAssistantAudioActive(false);
+      if (assistantAudioTailTimerRef.current != null) {
+        window.clearTimeout(assistantAudioTailTimerRef.current);
+        assistantAudioTailTimerRef.current = null;
+      }
+      return;
+    }
+    if (aiLevel > 0.015) {
+      setAssistantAudioActive(true);
+      if (assistantAudioTailTimerRef.current != null) {
+        window.clearTimeout(assistantAudioTailTimerRef.current);
+        assistantAudioTailTimerRef.current = null;
+      }
+      return;
+    }
+    if (assistantAudioTailTimerRef.current != null) window.clearTimeout(assistantAudioTailTimerRef.current);
+    assistantAudioTailTimerRef.current = window.setTimeout(() => {
+      setAssistantAudioActive(false);
+      assistantAudioTailTimerRef.current = null;
+    }, 220);
+  }, [state, aiLevel]);
 
   useEffect(() => {
     if (state !== "live") setPostTtsSilence(false);
@@ -291,12 +320,12 @@ export default function CallPage() {
       transport.current?.setTtsMicSuppress(false);
       return;
     }
-    const suppress = agentState === "speaking" || postTtsSilence;
+    const suppress = assistantSpeakingNow || postTtsSilence;
     transport.current?.setTtsMicSuppress(suppress);
     return () => {
       transport.current?.setTtsMicSuppress(false);
     };
-  }, [state, agentState, postTtsSilence]);
+  }, [state, assistantSpeakingNow, postTtsSilence]);
 
   // Each Web Speech final phrase → backend (was broken: ref compared after it was overwritten).
   useEffect(() => {
@@ -339,7 +368,7 @@ export default function CallPage() {
   // Sync Web Speech API results with chat messages
   useEffect(() => {
     if (state !== "live") return;
-    if (agentState === "speaking" || postTtsSilence) return;
+    if (assistantSpeakingNow || postTtsSilence) return;
 
     const combinedText = webSpeech.transcript + " " + webSpeech.interimTranscript;
     const trimmedText = combinedText.trim();
@@ -380,7 +409,7 @@ export default function CallPage() {
         },
       ];
     });
-  }, [webSpeech.transcript, webSpeech.interimTranscript, state, agentState, postTtsSilence]);
+  }, [webSpeech.transcript, webSpeech.interimTranscript, state, assistantSpeakingNow, postTtsSilence]);
 
   // Cleanup: remove empty bubbles after reasonable timeout
   useEffect(() => {
@@ -688,7 +717,7 @@ export default function CallPage() {
   const inPreload = preloading && state !== "live";
   const isLive = state === "live";
   /** Web Speech should only be "live" when we intentionally started it (not during TTS / tail). */
-  const dictationArmed = state === "live" && speechSupported && agentState !== "speaking" && !postTtsSilence;
+  const dictationArmed = state === "live" && speechSupported && !assistantSpeakingNow && !postTtsSilence;
   const speechUiListening = dictationArmed && webSpeech.isListening;
 
   return (
@@ -858,7 +887,7 @@ export default function CallPage() {
                       )}
                     />
                     <span className="text-ink-600">
-                      {agentState === "speaking"
+                      {assistantSpeakingNow
                         ? "Off (assistant speaking)"
                         : postTtsSilence
                           ? "Off (post-playback tail)"
