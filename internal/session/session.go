@@ -15,12 +15,10 @@ import (
 	"time"
 
 	"scorpion/agent/internal/actions"
-	"scorpion/agent/internal/audio"
 	"scorpion/agent/internal/config"
 	"scorpion/agent/internal/kb"
 	"scorpion/agent/internal/llm"
 	"scorpion/agent/internal/memory"
-	"scorpion/agent/internal/stt"
 	"scorpion/agent/internal/tts"
 	"scorpion/agent/internal/vad"
 )
@@ -28,22 +26,6 @@ import (
 // isCancel reports whether an error is just our own turn-cancellation
 // (barge-in, new utterance replacing an old one, session end). These are
 // expected control-flow signals and should not be surfaced as user errors.
-// looksLikeSTTHallucination filters common whisper.cpp junk on non-speech or noise.
-func looksLikeSTTHallucination(s string) bool {
-	lo := strings.ToLower(strings.TrimSpace(s))
-	if lo == "" {
-		return true
-	}
-	for _, p := range []string{
-		"[music", "[música", "[blank", "[silence", "(music)",
-		"thank you for watching", "subscribe", "like and subscribe",
-	} {
-		if strings.Contains(lo, p) {
-			return true
-		}
-	}
-	return false
-}
 
 func isCancel(err error) bool {
 	if err == nil {
@@ -76,7 +58,7 @@ type Deps struct {
 	Store *config.Store
 	Mem   *memory.DB
 	LLM   *llm.Client
-	STT   stt.Client
+	// STT   stt.Client // Removed - using Chrome Web Speech API
 	TTS   *tts.Pool
 	KB    *kb.Store
 }
@@ -110,6 +92,7 @@ type Session struct {
 	speechEpoch atomic.Uint64
 	lastPartial   string
 	muPartial     sync.Mutex
+	partialCancel context.CancelFunc
 }
 
 func New(id, clientID, convID string, deps *Deps) *Session {
@@ -121,9 +104,7 @@ func New(id, clientID, convID string, deps *Deps) *Session {
 		self: NewSelfFilter(cfg.SelfFilterNGram),
 	}
 	s.state.Store(StateIdle)
-	s.vad.OnUtterance = s.onUtterance
-	s.vad.OnVoiceStart = s.onVoiceStart
-	s.vad.OnPartial = s.onPartialAudio
+	// VAD callbacks removed - using Chrome Web Speech API directly
 	return s
 }
 
@@ -147,6 +128,10 @@ func (s *Session) onVoiceStart() {
 	s.speechEpoch.Add(1)
 	s.muPartial.Lock()
 	s.lastPartial = ""
+	if s.partialCancel != nil {
+		s.partialCancel()
+		s.partialCancel = nil
+	}
 	s.muPartial.Unlock()
 	// Always emit a voice_start so the UI can instantly render a "you're
 	// speaking…" ghost bubble before STT finishes. Barge-in still cancels the
@@ -166,102 +151,30 @@ func (s *Session) onPartialAudio(pcm16k []float32) {
 	if s.State() == StateEnded {
 		return
 	}
-	ep := s.speechEpoch.Load()
-	go s.handlePartialTranscribe(ep, pcm16k)
-}
-
-func (s *Session) handlePartialTranscribe(epoch uint64, pcm16k []float32) {
-	if s.State() == StateEnded {
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	res, err := s.Deps.STT.Transcribe(ctx, pcm16k)
-	if err != nil || res == nil {
-		return
-	}
-	if s.speechEpoch.Load() != epoch {
-		return
-	}
-	text := strings.TrimSpace(res.Text)
-	if text == "" || looksLikeSTTHallucination(text) {
-		return
-	}
+	
 	s.muPartial.Lock()
-	if text == s.lastPartial {
-		s.muPartial.Unlock()
-		return
+	if s.partialCancel != nil {
+		s.partialCancel()
 	}
-	s.lastPartial = text
+	_, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	s.partialCancel = cancel
 	s.muPartial.Unlock()
-	if s.speechEpoch.Load() != epoch {
-		return
-	}
-	s.emit("transcript_partial", map[string]any{
-		"speaker": "user",
-		"text":    text,
-	})
+
+	// Removed partial STT - using Chrome Web Speech API for real-time transcription
 }
 
-func (s *Session) onUtterance(pcm16k []float32) {
-	if s.State() == StateEnded {
-		return
-	}
-	go s.handleUtterance(pcm16k)
-}
-
-// HandleTextTurn processes a text-only user turn (no audio).
+// HandleTextTurn processes a text-only user turn from Chrome Web Speech API.
 func (s *Session) HandleTextTurn(ctx context.Context, text string) {
-	go s.runTurn(ctx, text)
-}
-
-func (s *Session) handleUtterance(pcm16k []float32) {
-	ctx, cancel := context.WithCancel(context.Background())
-	s.mu.Lock()
-	if s.turnCancel != nil {
-		s.turnCancel()
-	}
-	s.turnCtx, s.turnCancel = ctx, cancel
-	s.mu.Unlock()
-
-	// Stay in "listening" while STT runs; the UI only shows "thinking" once the LLM starts (llm_start).
-	s.setState(StateListening)
-	s.emit("stt_start", map[string]any{})
-	tStart := time.Now()
-	pcmWork := audio.TrimTrailingSilence(pcm16k, 320, 3000)
-	if len(pcmWork) < 1600 {
-		s.emit("utterance_empty", map[string]any{})
-		s.setState(StateListening)
-		return
-	}
-	res, err := s.Deps.STT.Transcribe(ctx, pcmWork)
-	if err != nil {
-		if !isCancel(err) {
-			s.emit("error", map[string]any{"stage": "stt", "err": err.Error()})
-		}
-		s.setState(StateListening)
-		return
-	}
-	text := strings.TrimSpace(res.Text)
+	text = strings.TrimSpace(text)
 	if text == "" {
-		// Empty utterance (noise / VAD false-positive). Tell the UI so any
-		// pending "you're speaking…" ghost bubble can be cleared.
-		s.emit("utterance_empty", map[string]any{})
-		s.setState(StateListening)
 		return
 	}
+	// Same layer-3 echo guard as server STT: laptop speakers often feed TTS back into the mic path.
 	if s.self.IsSelf(text) {
 		s.emit("self_filtered", map[string]any{"text": text})
-		s.setState(StateListening)
 		return
 	}
-	s.emit("transcript", map[string]any{
-		"speaker": "user",
-		"text":    text,
-		"latency_ms": time.Since(tStart).Milliseconds(),
-	})
-	_ = s.Deps.Mem.AppendTurn(&memory.Turn{ConvID: s.ConvID, Speaker: "user", Text: text})
-	s.runTurn(ctx, text)
+	go s.runTurn(ctx, text)
 }
 
 func (s *Session) runTurn(ctx context.Context, userText string) {

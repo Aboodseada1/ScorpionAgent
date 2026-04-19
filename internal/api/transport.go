@@ -113,7 +113,7 @@ func handleSessionWarmup(d *Deps) http.HandlerFunc {
 			ms     int64
 			errMsg string
 		}
-		results := make(chan result, 3)
+		results := make(chan result, 2) // Removed STT
 
 		// LLM: fire a 1-token generate to load the model into kv-cache.
 		go func() {
@@ -135,20 +135,11 @@ func handleSessionWarmup(d *Deps) http.HandlerFunc {
 			}
 			results <- res
 		}()
-		// STT: just /health ping.
-		go func() {
-			start := time.Now()
-			err := d.STT.Ping(ctx)
-			res := result{name: "stt", ok: err == nil, ms: time.Since(start).Milliseconds()}
-			if err != nil {
-				res.errMsg = err.Error()
-			}
-			results <- res
-		}()
+		// STT removed - using Chrome Web Speech API
 
 		status := map[string]any{}
 		allOK := true
-		for i := 0; i < 3; i++ {
+		for i := 0; i < 2; i++ { // Now only 2 results (LLM + TTS)
 			res := <-results
 			entry := map[string]any{"ok": res.ok, "ms": res.ms}
 			if res.errMsg != "" {
@@ -175,7 +166,8 @@ func handleSessionStart(d *Deps) http.HandlerFunc {
 			return
 		}
 		sess := session.New(conv.ID, body.ClientID, conv.ID, &session.Deps{
-			Store: d.Store, Mem: d.Mem, LLM: d.LLM, STT: d.STT, TTS: d.TTS, KB: d.KB,
+			Store: d.Store, Mem: d.Mem, LLM: d.LLM, TTS: d.TTS, KB: d.KB,
+			// STT: d.STT, // Removed - using Chrome Web Speech API
 		})
 		tr := &Transport{ID: conv.ID}
 		entry := &sessionEntry{sess: sess, tr: tr}

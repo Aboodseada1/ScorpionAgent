@@ -22,7 +22,7 @@ func handleStatus(d *Deps) http.HandlerFunc {
 		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 		defer cancel()
 		llmOK := d.LLM.Ping(ctx) == nil
-		sttOK := d.STT.Ping(ctx) == nil
+		// STT removed - using Chrome Web Speech API
 		piperOK := d.TTS.Available()
 		llmBase := cfg.LLMBaseURL
 		llmModel := cfg.LLMModel
@@ -44,7 +44,7 @@ func handleStatus(d *Deps) http.HandlerFunc {
 		writeJSON(w, 200, map[string]any{
 			"ok":          true,
 			"llm":         map[string]any{"ok": llmOK, "base_url": llmBase, "model": llmModel},
-			"stt":         map[string]any{"ok": sttOK, "base_url": cfg.WhisperBaseURL, "model": cfg.WhisperModel},
+			// "stt": removed - using Chrome Web Speech API
 			"piper":       map[string]any{"ok": piperOK, "bin": cfg.PiperBin, "model": cfg.PiperModel},
 			"server_time": time.Now().Unix(),
 		})

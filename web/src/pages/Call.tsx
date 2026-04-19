@@ -1,23 +1,26 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { useParams } from "react-router-dom";
 import {
   Phone,
   PhoneOff,
   Mic,
   MicOff,
   Send,
-  ArrowLeft,
   Sparkles,
   AlertTriangle,
   X,
   Check,
   Loader2,
+  Mic2,
+  Volume2,
+  VolumeX,
 } from "lucide-react";
 import clsx from "clsx";
 import { AnimatePresence, motion } from "framer-motion";
 import { api, type Action, type Client } from "../lib/api";
 import { sanitizeAssistantVisibleText } from "../lib/assistantSanitize";
 import { CallTransport } from "../lib/rtc";
+import { useWebSpeech } from "../hooks/useWebSpeech";
 
 type TransportState = "idle" | "connecting" | "live" | "ended";
 type AgentState = "idle" | "listening" | "thinking" | "speaking";
@@ -58,8 +61,86 @@ const nextMsgID = () => `m${++msgSeq}`;
 // Typewriter reveal speed: characters per animation frame (assistant final lines).
 const REVEAL_CHARS_PER_FRAME = 2;
 
-/** User live STT: fast tick + multi-word bursts when Whisper sends a big jump. */
-const STT_WORD_MS = 10;
+/** User live STT: balanced tick for smooth word-by-word display */
+const STT_WORD_MS = 16;  // ~60fps for smooth animation
+
+/** After TTS ends, keep Web Speech off briefly so room/speaker tail is not transcribed. */
+const POST_TTS_SPEECH_COOLDOWN_MS = 3000; // EXTENDED to 3 seconds for maximum echo protection
+
+const PLAY_ASSISTANT_VOICE_KEY = "scorpion_call_play_assistant_voice";
+
+function readPlayAssistantVoicePref(): boolean {
+  try {
+    return typeof localStorage !== "undefined" && localStorage.getItem(PLAY_ASSISTANT_VOICE_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function writePlayAssistantVoicePref(on: boolean): void {
+  try {
+    localStorage.setItem(PLAY_ASSISTANT_VOICE_KEY, on ? "1" : "0");
+  } catch {
+    /* noop */
+  }
+}
+
+function normalizeUtterance(s: string): string {
+  return s
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** True if the browser transcript is probably the assistant line played through speakers. */
+function utteranceLooksLikeTtsEcho(user: string, assistant: string, timeSinceAssistant: number): boolean {
+  const u = normalizeUtterance(user);
+  const a = normalizeUtterance(assistant);
+  if (!u || !a) return false;
+
+  // NUCLEAR OPTION: Block ANY text that appears during/after assistant speaks
+  if (timeSinceAssistant < 3000) { // 3 seconds after assistant spoke
+    return true; // BLOCK EVERYTHING for 3 seconds after TTS
+  }
+
+  // Exact match - definitely echo
+  if (u === a) return true;
+
+  // ANY overlap for short texts = echo (super aggressive)
+  if (u.length <= 10 || a.length <= 10) {
+    const overlapRatio = calculateOverlapRatio(u, a);
+    return overlapRatio >= 0.3; // 30% overlap for short texts
+  }
+
+  // Medium texts - be strict
+  if (u.length <= 20) {
+    const overlapRatio = calculateOverlapRatio(u, a);
+    return overlapRatio >= 0.25; // 25% overlap
+  }
+
+  // Long texts - moderate but still strict
+  const overlapRatio = calculateOverlapRatio(u, a);
+  return overlapRatio >= 0.2; // 20% overlap
+}
+
+function calculateOverlapRatio(user: string, assistant: string): number {
+  const uw = user.split(" ").filter(Boolean);
+  const aw = new Set(assistant.split(" ").filter(Boolean));
+
+  if (uw.length === 0 || aw.size === 0) return 0;
+
+  let inter = 0;
+  for (const w of uw) {
+    if (aw.has(w)) inter++;
+  }
+
+  const union = new Set([...uw, ...aw]).size;
+  if (union === 0) return 0;
+
+  return inter / union;
+}
 
 function revealNextWordChunk(fullText: string, revealed: number): number {
   if (revealed >= fullText.length) return revealed;
@@ -71,14 +152,14 @@ function revealNextWordChunk(fullText: string, revealed: number): number {
   return revealed + 1;
 }
 
-/** How many words to reveal per tick — more when we're behind the server stream. */
+/** Balanced word reveal speed - smooth but responsive */
 function sttWordsPerTick(fullLen: number, revealed: number): number {
   const backlog = fullLen - revealed;
   if (backlog <= 0) return 0;
-  if (backlog > 72) return 5;
-  if (backlog > 40) return 3;
-  if (backlog > 16) return 2;
-  return 1;
+  if (backlog > 30) return 5;  // Fast when behind
+  if (backlog > 15) return 3;  // Medium speed
+  if (backlog > 5) return 2;   // Slower for small chunks
+  return 1;  // One word at a time for final polish
 }
 
 export default function CallPage() {
@@ -95,26 +176,36 @@ export default function CallPage() {
   const [latency, setLatency] = useState<{ stt?: number; llm_first?: number; total?: number }>({});
   const llmStartAt = useRef<number | null>(null);
   const [muted, setMuted] = useState(false);
+  const [echoFreezeMode, setEchoFreezeMode] = useState(true); // HARD FREEZE echo blocking by default
+  /** Piper → tab speakers. Default off: laptop speakers + Web Speech = echo. Headphones: turn on. */
+  const [playAssistantVoice, setPlayAssistantVoice] = useState(readPlayAssistantVoicePref);
   const [startedAt, setStartedAt] = useState<number | null>(null);
   const [typing, setTyping] = useState("");
   const [micLevel, setMicLevel] = useState(0);
   const [aiLevel, setAILevel] = useState(0);
+  const [echoFilteredCount, setEchoFilteredCount] = useState(0); // Track echo filtering
   const [preload, setPreload] = useState<Record<WarmupKey, { status: PreloadState; ms?: number; err?: string }>>({
     llm: { status: "pending" },
     tts: { status: "pending" },
-    stt: { status: "pending" },
+    stt: { status: "ok" },
   });
   const [preloading, setPreloading] = useState(false);
+  // Chrome Web Speech API is now the only STT method
   const transport = useRef<CallTransport | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
-  /** While you are mid-utterance, show the big live caption; finalized lines stay in the thread. */
-  const { threadMessages, liveUserCaption } = useMemo(() => {
-    const last = messages[messages.length - 1];
-    if (last?.speaker === "user" && last.sttInterim) {
-      return { threadMessages: messages.slice(0, -1), liveUserCaption: last };
-    }
-    return { threadMessages: messages, liveUserCaption: null as ChatMessage | null };
+  // Chrome Web Speech API integration (primary STT method)
+  const webSpeech = useWebSpeech();
+  const lastWebSpeechRef = useRef<string>("");
+  /** Last finalized assistant text (for echo detection before send). */
+  const lastAssistantTextRef = useRef<string>("");
+  const lastAssistantTimeRef = useRef<number>(0); // Track when assistant last spoke
+  const speechResumeAtRef = useRef(0);
+  const [speechGateEpoch, setSpeechGateEpoch] = useState(0);
+
+  /** Show all messages including live STT - no more separate ugly live caption */
+  const { threadMessages } = useMemo(() => {
+    return { threadMessages: messages };
   }, [messages]);
 
   useEffect(() => {
@@ -195,13 +286,166 @@ export default function CallPage() {
     el.scrollTop = el.scrollHeight;
   }, [messages, notices.length]);
 
-  // Safety net: cull any pending ghost bubble that's been empty for too long.
+  const { isSupported: speechSupported, start: speechStart, stop: speechStop, reset: speechReset, setOnFinalPhrase } =
+    webSpeech;
+
+  // Mic dictation: AGGRESSIVELY off during TTS and for extended cooldown (speaker tail / room echo).
+  useEffect(() => {
+    if (state !== "live" || !speechSupported) {
+      speechStop();
+      return;
+    }
+    // COMPLETELY BLOCK speech while assistant is speaking
+    if (agentState === "speaking") {
+      speechStop();
+      return;
+    }
+
+    // EXTENDED COOLDOWN: Block for longer after assistant stops
+    const waitMs = speechResumeAtRef.current - Date.now();
+    if (waitMs > 0) {
+      speechStop();
+      const t = window.setTimeout(() => setSpeechGateEpoch((n) => n + 1), waitMs);
+      return () => window.clearTimeout(t);
+    }
+    speechStart();
+    return () => {
+      speechStop();
+    };
+  }, [state, agentState, speechSupported, speechStart, speechStop, speechGateEpoch]);
+
+  useEffect(() => {
+    transport.current?.setAssistantSpeakerOutput(playAssistantVoice);
+  }, [playAssistantVoice]);
+
+  // Each Web Speech final phrase → backend (was broken: ref compared after it was overwritten).
+  useEffect(() => {
+    setOnFinalPhrase((phrase) => {
+      const t = phrase.trim();
+
+      // NUCLEAR FREEZE: Completely block until manually released
+      if (echoFreezeMode) {
+        // Show user that echo protection is active
+        pushNotice("echo-freeze", "Echo protection active - use text input or headphones", "warn");
+        return; // COMPLETELY BLOCK ALL SPEECH
+      }
+
+      // NUCLEAR: Block everything during cooldown period
+      const timeSinceAssistant = Date.now() - lastAssistantTimeRef.current;
+      if (timeSinceAssistant < 4000) { // 4 seconds after assistant spoke
+        lastWebSpeechRef.current = "";
+        speechReset();
+        setEchoFilteredCount(prev => prev + 1);
+        return; // COMPLETELY BLOCK during cooldown
+      }
+
+      // Very short texts are often noise/echo artifacts
+      if (!t || t.length < 3 || !transport.current) return;
+
+      // Check against echo with aggressive thresholds
+      if (utteranceLooksLikeTtsEcho(t, lastAssistantTextRef.current, timeSinceAssistant)) {
+        lastWebSpeechRef.current = "";
+        speechReset();
+        setEchoFilteredCount(prev => prev + 1); // Track filtered echoes
+        // Show user notice about echo filtering
+        pushNotice("echo", "Filtered echo (assistant's voice was detected)", "warn");
+        return;
+      }
+
+      // Additional protection: reject very repetitive phrases (common in echo loops)
+      const recentUserTexts = messages
+        .filter(m => m.speaker === "user" && !m.partial)
+        .slice(-3)
+        .map(m => normalizeUtterance(m.fullText));
+
+      if (recentUserTexts.length >= 2) {
+        const isRepetitive = recentUserTexts.every(
+          recentText => normalizeUtterance(t) === recentText ||
+                       (t.length > 5 && recentText.includes(t))
+        );
+        if (isRepetitive) {
+          lastWebSpeechRef.current = "";
+          speechReset();
+          setEchoFilteredCount(prev => prev + 1);
+          pushNotice("repetitive", "Filtered repetitive text (possible echo)", "warn");
+          return;
+        }
+      }
+
+      transport.current.sendText(t);
+      lastWebSpeechRef.current = "";
+      setMessages((ms) => {
+        const last = ms[ms.length - 1];
+        if (last && last.speaker === "user" && last.partial) {
+          const copy = [...ms];
+          copy[copy.length - 1] = {
+            ...last,
+            fullText: t,
+            revealed: t.length,
+            partial: false,
+            sttInterim: false,
+          };
+          return copy;
+        }
+        return ms;
+      });
+      speechReset();
+    });
+    return () => setOnFinalPhrase(null);
+  }, [setOnFinalPhrase, speechReset, messages, echoFreezeMode]);
+
+  // Sync Web Speech API results with chat messages
+  useEffect(() => {
+    if (state !== "live") return;
+
+    const combinedText = webSpeech.transcript + " " + webSpeech.interimTranscript;
+    const trimmedText = combinedText.trim();
+
+    if (!trimmedText || trimmedText === lastWebSpeechRef.current) return;
+
+    lastWebSpeechRef.current = trimmedText;
+
+    setMessages((ms) => {
+      const last = ms[ms.length - 1];
+
+      // Update existing user message or create new one
+      if (last && last.speaker === "user" && (last.pending || last.partial)) {
+        const copy = [...ms];
+        copy[copy.length - 1] = {
+          ...last,
+          fullText: trimmedText,
+          revealed: trimmedText.length, // Show all text immediately
+          pending: false,
+          partial: true,
+          sttInterim: true,
+        };
+        return copy;
+      }
+
+      // Create new message if no existing user message
+      return [
+        ...ms,
+        {
+          id: nextMsgID(),
+          speaker: "user",
+          fullText: trimmedText,
+          revealed: trimmedText.length,
+          t: Date.now(),
+          pending: false,
+          partial: true,
+          sttInterim: true,
+        },
+      ];
+    });
+  }, [webSpeech.transcript, webSpeech.interimTranscript, state]);
+
+  // Cleanup: remove empty bubbles after reasonable timeout
   useEffect(() => {
     const hasStale = messages.some((m) => m.pending && !m.fullText);
     if (!hasStale) return;
     const handle = window.setTimeout(() => {
-      setMessages((ms) => ms.filter((m) => !(m.pending && !m.fullText && Date.now() - m.t > 6000)));
-    }, 6500);
+      setMessages((ms) => ms.filter((m) => !(m.pending && !m.fullText && Date.now() - m.t > 2000)));
+    }, 2500);  // Remove empty bubbles after 4.5 seconds total
     return () => window.clearTimeout(handle);
   }, [messages]);
 
@@ -227,6 +471,7 @@ export default function CallPage() {
   const start = async () => {
     if (!client) return;
     setMessages([]);
+    lastAssistantTextRef.current = "";
     setActions([]);
     setNotices([]);
     setLatency({});
@@ -237,12 +482,13 @@ export default function CallPage() {
     // ---- Phase 1: warmup every backing service in parallel. This makes the
     // first turn feel instant (LLM kv-cache hot, piper paged into RAM).
     setPreloading(true);
-    setPreload({ llm: { status: "running" }, tts: { status: "running" }, stt: { status: "running" } });
+    setPreload({ llm: { status: "running" }, tts: { status: "running" }, stt: { status: "ok" } });
     try {
       const res = await api.warmupSession();
-      const next: typeof preload = { llm: { status: "pending" }, tts: { status: "pending" }, stt: { status: "pending" } };
-      (Object.keys(res.status) as WarmupKey[]).forEach((k) => {
+      const next: typeof preload = { llm: { status: "pending" }, tts: { status: "pending" }, stt: { status: "ok" } };
+      (["llm", "tts"] as const).forEach((k) => {
         const s = res.status[k];
+        if (!s) return;
         next[k] = { status: s.ok ? "ok" : "failed", ms: s.ms, err: s.err };
       });
       setPreload(next);
@@ -250,7 +496,7 @@ export default function CallPage() {
         pushNotice(
           "warmup",
           Object.entries(res.status)
-            .filter(([, v]) => !v.ok)
+            .filter(([, v]) => v && !v.ok)
             .map(([k, v]) => `${k}: ${v.err || "unreachable"}`)
             .join(" · "),
           "error",
@@ -278,7 +524,7 @@ export default function CallPage() {
       t.onEvent = (e) => onEvent(e);
       t.onMicLevel = (l) => setMicLevel(l);
       t.onAILevel = (l) => setAILevel(l);
-      await t.start(session_id);
+      await t.start(session_id, { playAssistantAudio: playAssistantVoice });
       setPreloading(false);
     } catch (err) {
       pushNotice("startup", String(err), "error");
@@ -307,7 +553,13 @@ export default function CallPage() {
       case "voice_start": {
         setMessages((m) => {
           const last = m[m.length - 1];
-          if (last && last.speaker === "user" && last.pending) return m;
+          // Only create new bubble if last one is finalized or doesn't exist
+          if (last && last.speaker === "user" && last.pending) {
+            // Update timestamp of existing pending bubble
+            const copy = [...m];
+            copy[copy.length - 1] = { ...last, t: Date.now() };
+            return copy;
+          }
           return [
             ...m,
             {
@@ -323,9 +575,22 @@ export default function CallPage() {
         });
         break;
       }
-      case "utterance_empty":
-      case "self_filtered": {
+      case "utterance_empty": {
         setMessages((m) => dropPendingUser(m));
+        break;
+      }
+      case "self_filtered": {
+        const filtered = String(e.payload?.text || "").trim();
+        setMessages((m) => {
+          const next = dropPendingUser(m);
+          const last = next[next.length - 1];
+          if (!last || last.speaker !== "user") return next;
+          const prevAssistant = [...next.slice(0, -1)].reverse().find((x) => x.speaker === "assistant");
+          const drop =
+            (filtered && last.fullText.trim().toLowerCase() === filtered.toLowerCase()) ||
+            Boolean(prevAssistant && utteranceLooksLikeTtsEcho(last.fullText, prevAssistant.fullText, 99999)); // Use large time for message display check
+          return drop ? next.slice(0, -1) : next;
+        });
         break;
       }
       case "transcript_partial": {
@@ -338,6 +603,9 @@ export default function CallPage() {
         const speaker = (e.payload?.speaker || "user") as "user" | "assistant";
         const text = String(e.payload?.text || "");
         const route = e.payload?.route as "local" | "groq" | undefined;
+        if (speaker === "assistant" && text.trim()) {
+          lastAssistantTextRef.current = text;
+        }
         setMessages((m) => finalizeMessage(m, speaker, text, route));
         if (speaker === "user" && e.payload?.latency_ms != null) {
           setLatency((l) => ({ ...l, stt: Number(e.payload.latency_ms) }));
@@ -397,6 +665,9 @@ export default function CallPage() {
         break;
       case "tts_end":
         setAgentState("listening");
+        lastAssistantTimeRef.current = Date.now(); // Track when assistant finished speaking
+        speechResumeAtRef.current = Date.now() + POST_TTS_SPEECH_COOLDOWN_MS;
+        setSpeechGateEpoch((n) => n + 1);
         break;
       case "stt_start":
         // Stay on listening — "thinking" is only while the LLM runs (after STT).
@@ -427,12 +698,11 @@ export default function CallPage() {
     setTyping("");
   };
 
-  const ticking = useClock();
-  const elapsed = startedAt ? msToClock(ticking - startedAt) : "0:00";
+    
 
   if (!client) {
     return (
-      <div className="min-h-full grid place-items-center bg-paper text-ink-400">
+      <div className="flex-1 min-h-0 flex items-center justify-center bg-paper text-ink-400">
         <p className="text-sm">Loading…</p>
       </div>
     );
@@ -443,66 +713,49 @@ export default function CallPage() {
 
   return (
     <motion.div
-      className="h-full min-h-0 flex flex-col bg-gradient-to-br from-paper via-paper to-[#FFF6EE] text-ink-800 font-sans"
+      className="flex-1 min-h-0 flex flex-col overflow-hidden bg-gradient-to-br from-paper via-paper to-[#FFF6EE] text-ink-800 font-sans"
       initial={{ opacity: 0.92 }}
       animate={{ opacity: 1 }}
       transition={{ duration: 0.35 }}
     >
-      <header className="shrink-0 flex items-center justify-between gap-3 px-4 py-3 md:px-8 border-b border-ink-100/80 bg-card/85 backdrop-blur-md">
-        <Link
-          to={`/clients/${client.id}`}
-          className="inline-flex items-center gap-2 text-sm text-ink-500 hover:text-ink-900 transition"
-        >
-          <ArrowLeft size={16} /> Back to profile
-        </Link>
-        <div className="flex items-center gap-3 min-w-0 justify-center flex-1">
-          <div
-            className="h-10 w-10 rounded-full grid place-items-center font-display text-sm text-ink-800 shadow-soft shrink-0 ring-2 ring-white/80"
-            style={{ background: client.avatar_color || "#FFD6A5" }}
-          >
-            {initials(client.name)}
-          </div>
-          <div className="min-w-0 text-left hidden sm:block">
-            <div className="font-display text-sm text-ink-900 leading-tight truncate">{client.name}</div>
-            <div className="text-[11px] text-ink-400 truncate">{client.business || "—"}</div>
-          </div>
-          <StatusPill state={state} agent={agentState} />
-        </div>
-        <div className="text-xs text-ink-400 font-mono tabular-nums min-w-[4rem] text-right">
-          {isLive ? `live · ${elapsed}` : state}
-        </div>
-      </header>
+      
 
       {inPreload ? (
         <PreloadScreen preload={preload} />
       ) : (
         <div className="flex-1 min-h-0 flex flex-col lg:flex-row overflow-hidden">
-          <div className="flex-1 min-h-0 flex flex-col min-w-0 lg:border-r border-ink-100/80">
-            {isLive && liveUserCaption && (
-              <LiveUserHero m={liveUserCaption} micLevel={micLevel} muted={muted} />
-            )}
-
+          <div className="flex-1 min-h-0 flex flex-col min-w-0 lg:border-r border-ink-100/80 bg-paper/40">
             <div
               ref={scrollRef}
-              className="flex-1 min-h-0 overflow-y-auto px-4 py-5 md:px-8 md:py-8 grid-dots"
+              className="flex-1 min-h-0 overflow-y-auto px-4 py-4 md:px-8 md:py-5 grid-dots flex flex-col"
             >
-              {threadMessages.length === 0 && !liveUserCaption ? (
-                <CallLobby state={state} />
-              ) : (
-                <ul className="space-y-4 max-w-2xl mx-auto w-full">
-                  <AnimatePresence initial={false}>
-                    {threadMessages.map((m) => (
-                      <MessageBubble key={m.id} m={m} />
-                    ))}
-                  </AnimatePresence>
-                  {threadMessages.length === 0 && liveUserCaption && (
-                    <li className="text-center text-sm text-ink-400 py-8">Assistant reply will appear here.</li>
+              {threadMessages.length === 0 ? (
+                <div className="flex-1 min-h-[12rem] flex flex-col items-center justify-center gap-3 px-4 text-center">
+                  <p className="text-ink-500 text-sm max-w-md leading-relaxed">
+                    {state === "connecting" ? "Connecting…" : "Speak to start the conversation"}
+                  </p>
+                  {state !== "live" && state !== "connecting" && (
+                    <p className="text-ink-400 text-xs max-w-sm leading-relaxed">
+                      Tap <span className="font-medium text-ink-600">Start call</span>, then use your microphone or the field below.
+                    </p>
                   )}
-                </ul>
+                </div>
+              ) : (
+                <div className="flex-1 min-h-0 flex flex-col">
+                  <div className="min-h-full flex flex-1 flex-col justify-end py-2">
+                    <ul className="space-y-3 max-w-2xl mx-auto w-full pb-3">
+                      <AnimatePresence initial={false}>
+                        {threadMessages.map((m) => (
+                          <MessageBubble key={m.id} m={m} />
+                        ))}
+                      </AnimatePresence>
+                    </ul>
+                  </div>
+                </div>
               )}
             </div>
 
-            <div className="shrink-0 flex items-center gap-3 px-4 py-3 md:px-6 border-t border-ink-100 bg-card/90">
+            <div className="shrink-0 relative z-10 flex items-center gap-3 px-4 py-3.5 md:px-6 border-t border-ink-100 bg-card/95 backdrop-blur-sm shadow-[0_-10px_40px_rgba(26,26,23,0.06)]">
               {state !== "live" ? (
                 <button
                   type="button"
@@ -539,6 +792,31 @@ export default function CallPage() {
                   >
                     {muted ? <MicOff size={17} /> : <Mic size={17} />}
                   </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setPlayAssistantVoice((v) => {
+                        const next = !v;
+                        writePlayAssistantVoicePref(next);
+                        return next;
+                      });
+                    }}
+                    className={clsx(
+                      "h-11 w-11 rounded-full grid place-items-center shrink-0 transition shadow-soft border",
+                      playAssistantVoice
+                        ? "bg-ok/15 text-ok border-ok/35"
+                        : "bg-paper text-ink-500 border-ink-100 hover:border-ink-300",
+                    )}
+                    title={
+                      playAssistantVoice
+                        ? "Assistant voice on (Piper to speakers). Turn off on laptop speakers to stop echo."
+                        : "Assistant voice off — Piper not sent to speakers (stops mic picking up the AI). Use with headphones to turn on."
+                    }
+                  >
+                    {playAssistantVoice ? <Volume2 size={17} /> : <VolumeX size={17} />}
+                  </button>
+
                   <button
                     type="button"
                     onClick={hangup}
@@ -546,6 +824,21 @@ export default function CallPage() {
                     title="Hang up"
                   >
                     <PhoneOff size={17} />
+                  </button>
+
+                  {/* Echo Protection Toggle */}
+                  <button
+                    type="button"
+                    onClick={() => setEchoFreezeMode(!echoFreezeMode)}
+                    className={clsx(
+                      "h-11 w-11 rounded-full grid place-items-center shrink-0 transition shadow-soft border",
+                      echoFreezeMode
+                        ? "bg-bad/10 text-bad border-bad/30 hover:bg-bad/20"
+                        : "bg-ok/10 text-ok border-ok/30 hover:bg-ok/20",
+                    )}
+                    title={echoFreezeMode ? "Echo Protection: ON (speech blocked)" : "Echo Protection: OFF"}
+                  >
+                    <AlertTriangle size={17} />
                   </button>
                 </>
               )}
@@ -569,19 +862,97 @@ export default function CallPage() {
             </div>
           </div>
 
-          <aside className="lg:w-[min(380px,100%)] shrink-0 flex flex-col border-t lg:border-t-0 lg:border-l border-ink-100/80 bg-card/50 min-h-0 overflow-y-auto">
+          <aside className="lg:w-[min(400px,38vw)] w-full shrink-0 flex flex-col min-h-0 border-t lg:border-t-0 lg:border-l border-ink-100 bg-card/80 lg:bg-gradient-to-b lg:from-card/90 lg:to-paper/60">
             {isLive && (
-              <VoicePanel
-                client={client}
-                agentState={agentState}
-                micLevel={micLevel}
-                aiLevel={aiLevel}
-                muted={muted}
-                pendingLLMRoute={pendingLLMRoute}
-              />
+              <div className="shrink-0 border-b border-ink-100/80">
+                <VoicePanel
+                  client={client}
+                  agentState={agentState}
+                  micLevel={micLevel}
+                  aiLevel={aiLevel}
+                  muted={muted}
+                  pendingLLMRoute={pendingLLMRoute}
+                  speechListening={webSpeech.isListening}
+                />
+              </div>
             )}
 
-            <div className="p-5 md:p-6 space-y-5">
+            <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain p-4 md:p-5 space-y-4">
+              {/* Chrome Web Speech API Status - Always Enabled */}
+              {webSpeech.isSupported && (
+                <div className="rounded-2xl border border-ink-100 bg-paper/80 p-4 text-xs">
+                  <div className="flex items-center gap-2 text-sm font-display text-ink-600 mb-2">
+                    <Mic2 size={16} className="text-ok" />
+                    Browser speech
+                  </div>
+                  <div className="flex items-center gap-2 mb-2">
+                    <div
+                      className={clsx(
+                        "h-2 w-2 rounded-full",
+                        agentState === "speaking"
+                          ? "bg-ink-300"
+                          : webSpeech.isListening
+                            ? "bg-ok animate-pulse"
+                            : "bg-ink-300",
+                      )}
+                    />
+                    <span className="text-ink-600">
+                      {agentState === "speaking"
+                        ? "Blocked (assistant speaking)"
+                        : webSpeech.isListening
+                          ? "Listening for you"
+                          : "Starting…"}
+                    </span>
+                  </div>
+
+                  {/* Echo filtering indicator */}
+                  {echoFreezeMode && (
+                    <div className="flex items-center gap-2 mb-2 p-2 bg-red-50 rounded-lg border border-red-200">
+                      <AlertTriangle size={12} className="text-red-600" />
+                      <span className="text-red-700 font-medium">
+                        Echo Protection: ON (speech blocked)
+                      </span>
+                    </div>
+                  )}
+
+                  {!echoFreezeMode && echoFilteredCount > 0 && (
+                    <div className="flex items-center gap-2 mb-2">
+                      <AlertTriangle size={12} className="text-warn" />
+                      <span className="text-ink-600">
+                        Filtered {echoFilteredCount} echo{echoFilteredCount !== 1 ? "es" : ""}
+                      </span>
+                    </div>
+                  )}
+
+                  {webSpeech.error && (
+                    <div className="text-warn text-[11px] mt-1">Error: {webSpeech.error}</div>
+                  )}
+
+                  {/* Headphone recommendation */}
+                  <div className="mt-3 p-2 bg-blue-50 rounded-lg border border-blue-100">
+                    <div className="flex items-start gap-2">
+                      <Volume2 size={12} className="text-blue-600 mt-0.5 shrink-0" />
+                      <div className="text-[11px] text-ink-700 leading-tight">
+                        <strong className="text-blue-800">Best experience:</strong> Use headphones or move
+                        speakers away from mic to prevent the assistant from hearing itself.
+                      </div>
+                    </div>
+                  </div>
+
+                  {state === "live" && agentState !== "speaking" && webSpeech.isListening && (
+                    <div className="text-ink-500 text-[11px] mt-1 space-y-1">
+                      <p>Pause after a phrase to send; or type in the bar below.</p>
+                      {!playAssistantVoice && (
+                        <p className="text-ink-400">
+                          Piper is not played through the tab speakers by default (echo-safe). Use the speaker button in
+                          the bar below if you are on headphones.
+                        </p>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
+
               <div>
                 <div className="flex items-center gap-2 text-sm font-display text-ink-600 mb-2">
                   <Sparkles size={16} className="text-accent" /> Live actions
@@ -670,25 +1041,29 @@ function PreloadScreen({ preload }: { preload: Record<WarmupKey, { status: Prelo
   const steps: { key: WarmupKey; label: string; hint: string }[] = [
     { key: "llm", label: "Language model", hint: "KV cache warm" },
     { key: "tts", label: "Voice engine", hint: "Piper" },
-    { key: "stt", label: "Transcriber", hint: "Whisper" },
+    { key: "stt", label: "Transcriber", hint: "Web Speech (this browser)" },
   ];
   return (
     <motion.div
-      className="flex-1 grid place-items-center px-6 bg-gradient-to-br from-paper to-[#FFF6EE]"
+      className="flex-1 min-h-0 grid place-items-center px-6 py-10 bg-gradient-to-br from-paper to-[#FFF6EE]"
       initial={{ opacity: 0.9 }}
       animate={{ opacity: 1 }}
     >
-      <div className="max-w-lg w-full text-center">
-        <motion.div
-          className="inline-flex h-16 w-16 rounded-full bg-gradient-to-br from-accent to-ok text-white place-items-center mb-6 shadow-soft"
-          animate={{ scale: [1, 1.04, 1] }}
-          transition={{ duration: 2, repeat: Infinity, ease: "easeInOut" }}
-        >
-          <Phone size={26} />
-        </motion.div>
-        <div className="font-display text-2xl md:text-3xl text-ink-800 mb-2">Warming up the line</div>
-        <p className="text-ink-500 text-sm mb-8">LLM, voice, and speech services — then you are live.</p>
-        <ul className="space-y-2 text-left">
+      <div className="max-w-lg w-full mx-auto flex flex-col items-center text-center">
+        <div className="flex justify-center w-full mb-6">
+          <motion.div
+            className="flex h-16 w-16 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-accent to-ok text-white shadow-soft"
+            animate={{ scale: [1, 1.04, 1] }}
+            transition={{ duration: 2, repeat: Infinity, ease: "easeInOut" }}
+          >
+            <Phone size={26} className="shrink-0" strokeWidth={2} aria-hidden />
+          </motion.div>
+        </div>
+        <div className="font-display text-2xl md:text-3xl text-ink-800 mb-2 w-full">Warming up the line</div>
+        <p className="text-ink-500 text-sm mb-8 w-full max-w-md">
+          LLM, voice, and speech services — then you are live.
+        </p>
+        <ul className="space-y-2 w-full max-w-md text-left">
           {steps.map((s, i) => {
             const v = preload[s.key];
             return (
@@ -734,6 +1109,7 @@ function VoicePanel({
   aiLevel,
   muted,
   pendingLLMRoute,
+  speechListening,
 }: {
   client: Client;
   agentState: AgentState;
@@ -741,18 +1117,31 @@ function VoicePanel({
   aiLevel: number;
   muted: boolean;
   pendingLLMRoute: "local" | "groq" | null;
+  speechListening: boolean;
 }) {
   const userScale = 1 + (muted ? 0 : micLevel * 0.4);
   const aiScale = 1 + (agentState === "speaking" ? aiLevel * 0.35 : 0);
+  const userHot = !muted && micLevel > 0.04;
+  const userCaption = muted ? "muted" : userHot ? "speaking" : "you";
+
+  let aiCaption: string;
+  if (agentState === "speaking") aiCaption = "speaking";
+  else if (agentState === "thinking") {
+    aiCaption =
+      pendingLLMRoute === "local" ? "thinking · local" : pendingLLMRoute === "groq" ? "thinking · groq" : "thinking";
+  } else if (userHot) aiCaption = "hearing you";
+  else if (speechListening) aiCaption = "your turn";
+  else aiCaption = "ready";
+
   return (
-    <div className="flex items-center justify-center gap-10 md:gap-16 py-5 border-b border-ink-100/70 bg-paper/50">
+    <div className="flex items-center justify-center gap-8 md:gap-14 py-4 md:py-5 bg-paper/50">
       <AvatarOrb
         label={initials(client.name)}
         color={client.avatar_color || "#FFD6A5"}
-        active={!muted && micLevel > 0.02}
+        active={userHot}
         level={micLevel}
         scale={userScale}
-        caption={muted ? "muted" : agentState === "thinking" ? "…" : "you"}
+        caption={userCaption}
       />
       <motion.div
         className="text-ink-300 text-xs font-mono"
@@ -768,17 +1157,7 @@ function VoicePanel({
         active={agentState === "speaking"}
         level={aiLevel}
         scale={aiScale}
-        caption={
-          agentState === "speaking"
-            ? "speaking"
-            : agentState === "thinking"
-              ? pendingLLMRoute === "local"
-                ? "thinking · local"
-                : pendingLLMRoute === "groq"
-                  ? "thinking · groq"
-                  : "thinking"
-              : "listening"
-        }
+        caption={aiCaption}
         variant="ai"
       />
     </div>
@@ -869,60 +1248,6 @@ function AvatarOrb({
   );
 }
 
-function LiveUserHero({
-  m,
-  micLevel,
-  muted,
-}: {
-  m: ChatMessage;
-  micLevel: number;
-  muted: boolean;
-}) {
-  const line = m.fullText.slice(0, m.revealed);
-  const active = !muted && micLevel > 0.04;
-  return (
-    <div className="shrink-0 border-b border-ink-100 bg-gradient-to-r from-accent/[0.07] via-paper to-rose-500/[0.06]">
-      <div className="max-w-4xl mx-auto px-4 py-5 md:px-8 md:py-6">
-        <div className="flex items-center justify-between gap-3 mb-3">
-          <span className="text-[10px] font-semibold tracking-[0.28em] text-accent uppercase">Live · streaming</span>
-          {active ? (
-            <span className="flex gap-1.5 items-center text-[10px] font-medium text-ok uppercase tracking-wider">
-              <span className="inline-flex gap-0.5 items-end h-3.5">
-                <span className="w-1 rounded-full bg-ok animate-pulse h-2" />
-                <span className="w-1 rounded-full bg-ok/80 animate-pulse h-3 [animation-delay:100ms]" />
-                <span className="w-1 rounded-full bg-ok/60 animate-pulse h-1.5 [animation-delay:200ms]" />
-              </span>
-              Speaking
-            </span>
-          ) : null}
-        </div>
-        <p className="font-display text-[clamp(1.25rem,3.2vw,1.85rem)] leading-snug text-ink-900 whitespace-pre-wrap break-words">
-          {line || "…"}
-          {m.revealed < m.fullText.length ? (
-            <span className="inline-block w-0.5 h-[0.95em] ml-0.5 align-[-0.06em] bg-accent animate-pulse rounded-sm" />
-          ) : null}
-        </p>
-        <p className="text-[11px] text-ink-400 mt-2">Words appear in order as the transcript updates.</p>
-      </div>
-    </div>
-  );
-}
-
-function CallLobby({ state }: { state: TransportState }) {
-  return (
-    <div className="min-h-[min(380px,50vh)] flex flex-col items-center justify-center text-center px-4 py-10">
-      <div className="max-w-md">
-        <h1 className="font-display text-3xl md:text-4xl text-ink-800 mb-3">Ready to call</h1>
-        <p className="text-ink-500 text-sm leading-relaxed">
-          {state === "connecting"
-            ? "Connecting the microphone…"
-            : "Press Start call, allow the mic, then speak. Your words stream word-by-word in the live strip at the top."}
-        </p>
-      </div>
-    </div>
-  );
-}
-
 function MessageBubble({ m }: { m: ChatMessage }) {
   const isUser = m.speaker === "user";
   const baseText = useMemo(
@@ -942,18 +1267,17 @@ function MessageBubble({ m }: { m: ChatMessage }) {
   return (
     <motion.li
       layout="position"
-      initial={{ opacity: 0, y: 8 }}
-      animate={{ opacity: 1, y: 0 }}
-      exit={{ opacity: 0, y: -6 }}
+      initial={{ opacity: 0, y: 8, scale: 0.95 }}
+      animate={{ opacity: 1, y: 0, scale: 1 }}
+      exit={{ opacity: 0, y: -6, scale: 0.95 }}
       transition={{ type: "spring", stiffness: 400, damping: 30 }}
-      className={clsx("flex gap-2 items-end", isUser ? "justify-end" : "justify-start")}
+      className={clsx("flex w-full", isUser ? "justify-end" : "justify-start")}
     >
-      {!isUser && <Avatar kind="assistant" />}
-      <div className="max-w-[min(90%,32rem)] flex flex-col gap-1 items-start">
+      <div className="max-w-[min(85%,28rem)] flex flex-col gap-1 items-start">
         {!isUser && m.llmRoute && (
           <span
             className={clsx(
-              "text-[10px] font-mono uppercase tracking-wider rounded-full px-2 py-0.5 border",
+              "text-[10px] font-mono uppercase tracking-wider rounded-full px-2 py-0.5 border self-start",
               m.llmRoute === "local" ? "border-ok/30 bg-ok/10 text-ok" : "border-accent/30 bg-accent/10 text-accent",
             )}
           >
@@ -962,15 +1286,15 @@ function MessageBubble({ m }: { m: ChatMessage }) {
         )}
         <motion.div
           className={clsx(
-            "w-full rounded-2xl px-4 py-2.5 text-[14px] leading-relaxed shadow-sm border",
+            "w-full rounded-[20px] px-4 py-2.5 text-[15px] leading-relaxed shadow-sm",
             isUser
               ? clsx(
-                  "bg-gradient-to-br from-accent to-rose-500 text-white border-transparent rounded-br-md",
-                  userInterim && "text-white/75",
+                  "bg-[#007AFF] text-white rounded-br-sm",
+                  userInterim && "opacity-90",
                 )
               : clsx(
-                  "bg-card border-ink-100 text-ink-800 rounded-bl-md",
-                  asstStreaming && "text-ink-500",
+                  "bg-white border border-ink-100 text-ink-900 rounded-bl-sm",
+                  asstStreaming && "text-ink-600",
                 ),
           )}
         >
@@ -979,26 +1303,12 @@ function MessageBubble({ m }: { m: ChatMessage }) {
           ) : (
             <>
               <span className="whitespace-pre-wrap break-words">{reveal}</span>
-              {showCursor && <span className="inline-block w-0.5 h-[1em] ml-0.5 align-[-0.08em] bg-current opacity-45 animate-pulse rounded-sm" />}
+              {showCursor && <span className="inline-block w-0.5 h-[1em] ml-0.5 align-[-0.08em] bg-current opacity-60 animate-pulse rounded-sm" />}
             </>
           )}
         </motion.div>
       </div>
-      {isUser && <Avatar kind="user" />}
     </motion.li>
-  );
-}
-
-function Avatar({ kind }: { kind: "user" | "assistant" }) {
-  return (
-    <span
-      className={clsx(
-        "h-7 w-7 shrink-0 rounded-full grid place-items-center text-[11px] font-display shadow-soft mt-0.5",
-        kind === "assistant" ? "bg-ink-800 text-paper" : "bg-accent text-white",
-      )}
-    >
-      {kind === "assistant" ? "AI" : "You"}
-    </span>
   );
 }
 
@@ -1009,30 +1319,6 @@ function TypingDots() {
       <span className="h-1.5 w-1.5 rounded-full bg-ink-400 animate-bounce [animation-delay:-0.1s]" />
       <span className="h-1.5 w-1.5 rounded-full bg-ink-400 animate-bounce" />
     </span>
-  );
-}
-
-function StatusPill({ state, agent }: { state: TransportState; agent: AgentState }) {
-  const label = state !== "live" ? state : agent;
-  const color =
-    state !== "live"
-      ? "bg-ink-100 text-ink-500"
-      : agent === "speaking"
-        ? "bg-accent/10 text-accent"
-        : agent === "thinking"
-          ? "bg-warn/10 text-warn"
-          : "bg-ok/10 text-ok";
-  return (
-    <motion.span
-      layout
-      key={label}
-      initial={{ opacity: 0.6, scale: 0.96 }}
-      animate={{ opacity: 1, scale: 1 }}
-      transition={{ type: "spring", stiffness: 500, damping: 34 }}
-      className={clsx("px-2.5 py-0.5 rounded-full text-[11px] capitalize", color)}
-    >
-      {label}
-    </motion.span>
   );
 }
 
@@ -1074,14 +1360,17 @@ function appendAssistantDelta(msgs: ChatMessage[], delta: string): ChatMessage[]
   ];
 }
 
-// Live STT: server extends fullText; keep revealed behind so the word interval animates.
-// Never set revealed = fullText.length here — that would skip word-by-word display.
+// Balanced display: show text with smooth word-by-word animation
 function updateUserPartialCaption(msgs: ChatMessage[], text: string): ChatMessage[] {
   const last = msgs[msgs.length - 1];
   if (last && last.speaker === "user" && (last.pending || last.partial)) {
     let revealed = last.revealed;
-    if (text.length < revealed) revealed = text.length;
-    revealed = Math.min(revealed, text.length);
+    // Gradually reveal more text for smooth animation
+    if (text.length > revealed) {
+      revealed = Math.min(revealed + Math.ceil((text.length - revealed) * 0.4), text.length);
+    } else {
+      revealed = text.length;
+    }
     const copy = msgs.slice();
     copy[copy.length - 1] = {
       ...last,
@@ -1099,7 +1388,7 @@ function updateUserPartialCaption(msgs: ChatMessage[], text: string): ChatMessag
       id: nextMsgID(),
       speaker: "user",
       fullText: text,
-      revealed: 0,
+      revealed: Math.ceil(text.length * 0.6), // Reveal most immediately
       t: Date.now(),
       pending: false,
       partial: true,
@@ -1180,16 +1469,4 @@ function initials(s: string) {
   return (p[0]?.[0] || "?") + (p[1]?.[0] || "");
 }
 
-function useClock() {
-  const [t, setT] = useState(Date.now());
-  useEffect(() => {
-    const id = window.setInterval(() => setT(Date.now()), 500);
-    return () => window.clearInterval(id);
-  }, []);
-  return t;
-}
 
-function msToClock(ms: number) {
-  const s = Math.max(0, Math.floor(ms / 1000));
-  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
-}

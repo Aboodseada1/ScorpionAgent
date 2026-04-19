@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLocation } from "react-router-dom";
 import {
   Check,
@@ -83,7 +83,7 @@ export default function SettingsPage() {
   ];
 
   return (
-    <div className="h-full">
+    <div className="flex-1 min-h-0 overflow-y-auto">
       <div className="px-10 pt-10 pb-4 flex items-start justify-between">
         <div>
           <div className="text-xs uppercase tracking-wider text-ink-400">Config</div>
@@ -754,7 +754,7 @@ function LLMSection({
     }
   };
 
-  const load = async () => {
+  const load = useCallback(async () => {
     setLoading(true);
     try {
       const r = await api.listModels();
@@ -764,14 +764,19 @@ function LLMSection({
       const installedNow = new Set((r.models || []).map((m) => m.id));
       setInstalling((prev) => {
         const next = new Set<string>();
-        prev.forEach((id) => { if (!installedNow.has(id)) next.add(id); });
+        prev.forEach((id) => {
+          if (!installedNow.has(id)) next.add(id);
+        });
         return next;
       });
     } finally {
       setLoading(false);
     }
-  };
-  useEffect(() => { load(); }, [navKey]);
+  }, []);
+  useEffect(() => {
+    if (provider !== "local") return;
+    void load();
+  }, [navKey, provider, load]);
 
   const installedIDs = new Set(models.map((m) => m.id));
   const toInstall = catalog.filter((c) => !installedIDs.has(c.id) && !installing.has(c.id));
@@ -935,134 +940,132 @@ function LLMSection({
         )}
       </SectionCard>
 
-      <SectionCard
-        icon={<Cpu size={16} />}
-        title="Installed models"
-        actions={
-          <button onClick={load} className="text-xs text-ink-500 hover:text-ink-800 flex items-center gap-1">
-            <RefreshCw size={12} /> Rescan
-          </button>
-        }
-      >
-        {provider !== "local" && (
-          <p className="text-xs text-ink-500 rounded-xl border border-ink-100 bg-ink-50/80 px-3 py-2">
-            The running agent uses <span className="font-mono">{provider}</span> above. Local GGUFs below apply only when
-            inference provider is <span className="font-mono">local</span>.
-          </p>
-        )}
-        {loading ? (
-          <div className="text-sm text-ink-400">Loading…</div>
-        ) : models.length === 0 ? (
-          <div className="text-sm text-ink-400">
-            No local models. Install one from the catalog below — llama.cpp will reload
-            automatically after download finishes.
-          </div>
-        ) : (
-          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
-            {models.map((m) => {
-              const active = m.file === activePath || m.active;
-              return (
-                <div
-                  key={m.id}
-                  className={clsx(
-                    "rounded-2xl border p-4",
-                    active ? "border-accent bg-accent/5 shadow-soft" : "border-ink-100 bg-paper",
-                  )}
-                >
-                  <div className="flex items-start justify-between gap-2">
-                    <div className="min-w-0">
-                      <div className="font-display text-lg text-ink-800 truncate" title={m.name}>
-                        {m.name}
+      {provider === "local" && (
+        <>
+          <SectionCard
+            icon={<Cpu size={16} />}
+            title="Installed models"
+            actions={
+              <button onClick={() => void load()} className="text-xs text-ink-500 hover:text-ink-800 flex items-center gap-1">
+                <RefreshCw size={12} /> Rescan
+              </button>
+            }
+          >
+            {loading ? (
+              <div className="text-sm text-ink-400">Loading…</div>
+            ) : models.length === 0 ? (
+              <div className="text-sm text-ink-400">
+                No local models. Install one from the catalog below — llama.cpp will reload
+                automatically after download finishes.
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+                {models.map((m) => {
+                  const active = m.file === activePath || m.active;
+                  return (
+                    <div
+                      key={m.id}
+                      className={clsx(
+                        "rounded-2xl border p-4",
+                        active ? "border-accent bg-accent/5 shadow-soft" : "border-ink-100 bg-paper",
+                      )}
+                    >
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="min-w-0">
+                          <div className="font-display text-lg text-ink-800 truncate" title={m.name}>
+                            {m.name}
+                          </div>
+                          <div className="text-xs text-ink-500 font-mono mt-0.5">
+                            {m.family} · {m.quant || "gguf"} · {m.size_gb.toFixed(2)} GB
+                          </div>
+                        </div>
+                        {active && (
+                          <span className="text-[10px] uppercase tracking-wider bg-accent text-white rounded-full px-2 py-0.5">
+                            Active
+                          </span>
+                        )}
                       </div>
-                      <div className="text-xs text-ink-500 font-mono mt-0.5">
-                        {m.family} · {m.quant || "gguf"} · {m.size_gb.toFixed(2)} GB
-                      </div>
+                      <button
+                        onClick={() => switchTo(m.id)}
+                        disabled={active || swapping === m.id}
+                        className={clsx(
+                          "mt-3 w-full text-xs rounded-full px-3 py-1.5",
+                          active
+                            ? "bg-ok/10 text-ok cursor-default"
+                            : "bg-ink-800 text-paper hover:bg-ink-700 disabled:opacity-50",
+                        )}
+                      >
+                        {active ? (
+                          <span className="flex items-center justify-center gap-1">
+                            <Check size={12} /> In use
+                          </span>
+                        ) : swapping === m.id ? (
+                          <span className="flex items-center justify-center gap-1">
+                            <Loader2 size={12} className="animate-spin" /> Swapping…
+                          </span>
+                        ) : (
+                          "Use model"
+                        )}
+                      </button>
                     </div>
-                    {active && (
-                      <span className="text-[10px] uppercase tracking-wider bg-accent text-white rounded-full px-2 py-0.5">
-                        Active
-                      </span>
-                    )}
+                  );
+                })}
+              </div>
+            )}
+          </SectionCard>
+
+          <SectionCard icon={<Download size={16} />} title="Model catalog">
+            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+              {toInstall.map((e) => (
+                <div key={e.id} className="rounded-2xl border border-ink-100 bg-paper p-4 flex flex-col">
+                  <div className="font-medium text-ink-800">{e.name}</div>
+                  <div className="text-xs text-ink-500 font-mono mt-0.5">
+                    {e.family} · {e.params} · {e.quant}
                   </div>
+                  <div className="text-xs text-ink-400 mt-2 flex-1 leading-relaxed">{e.blurb}</div>
+                  <div className="text-xs text-ink-400 mt-2">≈ {e.approx_gb.toFixed(2)} GB</div>
                   <button
-                    onClick={() => switchTo(m.id)}
-                    disabled={active || swapping === m.id}
-                    className={clsx(
-                      "mt-3 w-full text-xs rounded-full px-3 py-1.5",
-                      active
-                        ? "bg-ok/10 text-ok cursor-default"
-                        : "bg-ink-800 text-paper hover:bg-ink-700 disabled:opacity-50",
-                    )}
+                    onClick={() => installCatalog(e.id)}
+                    className="mt-3 inline-flex items-center justify-center gap-1 text-xs rounded-full px-3 py-1.5 bg-ink-800 text-paper hover:bg-ink-700"
                   >
-                    {active ? (
-                      <span className="flex items-center justify-center gap-1">
-                        <Check size={12} /> In use
-                      </span>
-                    ) : swapping === m.id ? (
-                      <span className="flex items-center justify-center gap-1">
-                        <Loader2 size={12} className="animate-spin" /> Swapping…
-                      </span>
-                    ) : (
-                      "Use model"
-                    )}
+                    <Download size={12} /> Install
                   </button>
                 </div>
-              );
-            })}
-          </div>
-        )}
-      </SectionCard>
+              ))}
+              {toInstall.length === 0 && (
+                <div className="text-sm text-ink-400 col-span-3">All catalog models already installed.</div>
+              )}
+            </div>
+          </SectionCard>
 
-      <SectionCard icon={<Download size={16} />} title="Model catalog">
-        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
-          {toInstall.map((e) => (
-            <div key={e.id} className="rounded-2xl border border-ink-100 bg-paper p-4 flex flex-col">
-              <div className="font-medium text-ink-800">{e.name}</div>
-              <div className="text-xs text-ink-500 font-mono mt-0.5">
-                {e.family} · {e.params} · {e.quant}
-              </div>
-              <div className="text-xs text-ink-400 mt-2 flex-1 leading-relaxed">{e.blurb}</div>
-              <div className="text-xs text-ink-400 mt-2">≈ {e.approx_gb.toFixed(2)} GB</div>
+          <SectionCard icon={<Download size={16} />} title="Install custom GGUF">
+            <p className="text-xs text-ink-500 mb-3">
+              Paste any Hugging Face <code className="font-mono">/resolve/main/…gguf</code> URL and a filename.
+              The file will land in <code className="font-mono">models/&lt;id&gt;/</code>.
+            </p>
+            <div className="grid grid-cols-1 md:grid-cols-5 gap-2">
+              <input
+                value={customURL}
+                onChange={(e) => setCustomURL(e.target.value)}
+                placeholder="https://huggingface.co/.../model.gguf"
+                className="md:col-span-3 rounded-xl border border-ink-100 bg-paper px-3 py-2 text-sm font-mono"
+              />
+              <input
+                value={customName}
+                onChange={(e) => setCustomName(e.target.value)}
+                placeholder="model.gguf"
+                className="md:col-span-1 rounded-xl border border-ink-100 bg-paper px-3 py-2 text-sm font-mono"
+              />
               <button
-                onClick={() => installCatalog(e.id)}
-                className="mt-3 inline-flex items-center justify-center gap-1 text-xs rounded-full px-3 py-1.5 bg-ink-800 text-paper hover:bg-ink-700"
+                onClick={installCustom}
+                className="md:col-span-1 rounded-xl bg-ink-800 text-paper text-sm px-3 py-2 hover:bg-ink-700"
               >
-                <Download size={12} /> Install
+                Download
               </button>
             </div>
-          ))}
-          {toInstall.length === 0 && (
-            <div className="text-sm text-ink-400 col-span-3">All catalog models already installed.</div>
-          )}
-        </div>
-      </SectionCard>
-
-      <SectionCard icon={<Download size={16} />} title="Install custom GGUF">
-        <p className="text-xs text-ink-500 mb-3">
-          Paste any Hugging Face <code className="font-mono">/resolve/main/…gguf</code> URL and a filename.
-          The file will land in <code className="font-mono">models/&lt;id&gt;/</code>.
-        </p>
-        <div className="grid grid-cols-1 md:grid-cols-5 gap-2">
-          <input
-            value={customURL}
-            onChange={(e) => setCustomURL(e.target.value)}
-            placeholder="https://huggingface.co/.../model.gguf"
-            className="md:col-span-3 rounded-xl border border-ink-100 bg-paper px-3 py-2 text-sm font-mono"
-          />
-          <input
-            value={customName}
-            onChange={(e) => setCustomName(e.target.value)}
-            placeholder="model.gguf"
-            className="md:col-span-1 rounded-xl border border-ink-100 bg-paper px-3 py-2 text-sm font-mono"
-          />
-          <button
-            onClick={installCustom}
-            className="md:col-span-1 rounded-xl bg-ink-800 text-paper text-sm px-3 py-2 hover:bg-ink-700"
-          >
-            Download
-          </button>
-        </div>
-      </SectionCard>
+          </SectionCard>
+        </>
+      )}
 
       <DownloadsStrip kind="llm" onJobDone={load} />
     </div>

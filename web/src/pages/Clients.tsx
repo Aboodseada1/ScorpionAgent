@@ -19,7 +19,7 @@ export default function ClientsPage() {
     : clients;
 
   return (
-    <div className="h-full">
+    <div className="flex-1 min-h-0 overflow-y-auto">
       <div className="px-10 pt-10 pb-6 flex items-end justify-between">
         <div>
           <div className="text-xs uppercase tracking-wider text-ink-400">Prospects</div>

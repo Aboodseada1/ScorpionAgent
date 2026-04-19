@@ -38,6 +38,10 @@ export class CallTransport {
   private ttsScheduledTime = 0;
   /** Mutes all TTS routed through this node (barge-in / interrupt). */
   private ttsGain?: GainNode;
+  /** When false, Piper never reaches speakers (stops laptop-mic echo into Web Speech). */
+  private assistantSpeakersOn = false;
+  /** After `muteIncomingTTS`, restore only when this is cleared in `unmuteIncomingTTS`. */
+  private bargeDucked = false;
   private disposed = false;
   private announced: "idle" | "connecting" | "live" | "ended" = "idle";
 
@@ -47,8 +51,17 @@ export class CallTransport {
     this.onStateChange(s);
   }
 
-  async start(sessionID: string): Promise<void> {
+  /**
+   * @param playAssistantAudio When false (default), TTS is decoded for levels/UI but not sent to
+   *   `audioCtx.destination` — required for laptop speakers + browser dictation without echo.
+   */
+  async start(
+    sessionID: string,
+    options?: { playAssistantAudio?: boolean },
+  ): Promise<void> {
     this.setState("connecting");
+    this.assistantSpeakersOn = options?.playAssistantAudio ?? false;
+    this.bargeDucked = false;
     // 1) get mic with AEC+NS+AGC on
     this.micStream = await navigator.mediaDevices.getUserMedia({
       audio: {
@@ -63,7 +76,7 @@ export class CallTransport {
     // 2) build AudioContext and worklet to downsample mic to 16 kHz PCM16
     this.audioCtx = new AudioContext({ sampleRate: 48000 });
     this.ttsGain = this.audioCtx.createGain();
-    this.ttsGain.gain.value = 1;
+    this.ttsGain.gain.value = this.assistantSpeakersOn ? 1 : 0;
     this.ttsGain.connect(this.audioCtx.destination);
 
     const workletURL = URL.createObjectURL(new Blob([MIC_WORKLET_SRC], { type: "text/javascript" }));
@@ -127,7 +140,24 @@ export class CallTransport {
   }
 
   setMuted(muted: boolean): void {
-    this.micStream?.getAudioTracks().forEach((t) => { t.enabled = !muted; });
+    this.micStream?.getAudioTracks().forEach((t) => {
+      t.enabled = !muted;
+    });
+  }
+
+  /** Route Piper output to the tab speakers (off by default to avoid mic echo with Web Speech). */
+  setAssistantSpeakerOutput(on: boolean): void {
+    this.assistantSpeakersOn = on;
+    if (this.disposed || this.bargeDucked || !this.ttsGain || !this.audioCtx) return;
+    const g = this.ttsGain;
+    const t = this.audioCtx.currentTime;
+    const v = on ? 1 : 0;
+    try {
+      g.gain.cancelScheduledValues(t);
+      g.gain.setValueAtTime(v, t);
+    } catch {
+      g.gain.value = v;
+    }
   }
 
   /** Instantly silence queued/playing assistant audio (server barge-in). Next `tts_start` unmutes. */
@@ -135,6 +165,7 @@ export class CallTransport {
     const g = this.ttsGain;
     const ctx = this.audioCtx;
     if (!g || !ctx) return;
+    this.bargeDucked = true;
     const t = ctx.currentTime;
     try {
       g.gain.cancelScheduledValues(t);
@@ -150,12 +181,14 @@ export class CallTransport {
     const g = this.ttsGain;
     const ctx = this.audioCtx;
     if (!g || !ctx) return;
+    this.bargeDucked = false;
     const t = ctx.currentTime;
+    const v = this.assistantSpeakersOn ? 1 : 0;
     try {
       g.gain.cancelScheduledValues(t);
-      g.gain.setValueAtTime(1, t);
+      g.gain.setValueAtTime(v, t);
     } catch {
-      g.gain.value = 1;
+      g.gain.value = v;
     }
   }
 

@@ -41,7 +41,7 @@ export default function MonitorPage() {
   }, [last]);
 
   return (
-    <div className="h-full">
+    <div className="flex-1 min-h-0 overflow-y-auto">
       <div className="px-10 pt-10 pb-4 flex items-start justify-between">
         <div>
           <div className="text-xs uppercase tracking-wider text-ink-400">System</div>

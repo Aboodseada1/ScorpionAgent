@@ -2,18 +2,26 @@
 @tailwind components;
 @tailwind utilities;
 
-html,
-body,
-#root {
+html {
   height: 100%;
 }
 
 body {
+  height: 100%;
+  margin: 0;
   font-family: "Inter", ui-sans-serif, system-ui;
-  background-color: #FAFAF7;
+  background-color: #fafaf7;
   color: #1a1a17;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
+}
+
+/* Flex column root so nested routes can use flex-1 / min-h-0 for full-height layouts */
+#root {
+  min-height: 100%;
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
 }
 
 /* Shared motion tokens (Framer Motion uses inline transitions; CSS vars for non-motion UI) */

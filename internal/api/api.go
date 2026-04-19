@@ -17,7 +17,6 @@ import (
 	"scorpion/agent/internal/llm"
 	"scorpion/agent/internal/llmmodels"
 	"scorpion/agent/internal/memory"
-	"scorpion/agent/internal/stt"
 	"scorpion/agent/internal/sysmetrics"
 	"scorpion/agent/internal/tts"
 	"scorpion/agent/internal/voices"
@@ -27,7 +26,7 @@ type Deps struct {
 	Store     *config.Store
 	Mem       *memory.DB
 	LLM       *llm.Client
-	STT       stt.Client
+	// STT       stt.Client // Removed - using Chrome Web Speech API
 	TTS       *tts.Pool
 	KB        *kb.Store
 	Voices    *voices.Store
@@ -113,7 +112,20 @@ func Router(d *Deps) http.Handler {
 }
 
 func spaFileServer(dir string) http.Handler {
-	return http.StripPrefix("/assets", http.FileServer(http.Dir(filepath.Join(dir, "assets"))))
+	root := http.Dir(filepath.Join(dir, "assets"))
+	fs := http.FileServer(root)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Avoid wrong MIME (e.g. text/plain) when the host OS mime DB is thin.
+		switch strings.ToLower(filepath.Ext(r.URL.Path)) {
+		case ".css":
+			w.Header().Set("Content-Type", "text/css; charset=utf-8")
+		case ".js":
+			w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+		case ".svg":
+			w.Header().Set("Content-Type", "image/svg+xml; charset=utf-8")
+		}
+		http.StripPrefix("/assets", fs).ServeHTTP(w, r)
+	})
 }
 
 func spaIndex(dir string) http.HandlerFunc {
@@ -129,6 +141,8 @@ func spaIndex(dir string) http.HandlerFunc {
 			return
 		}
 		index := filepath.Join(dir, "index.html")
+		// Fresh index avoids a cached HTML referencing hashed assets that no longer exist.
+		w.Header().Set("Cache-Control", "no-cache")
 		http.ServeFile(w, r, index)
 	}
 }

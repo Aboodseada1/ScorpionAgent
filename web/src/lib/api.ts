@@ -77,7 +77,8 @@ export interface Settings {
 export interface StatusResp {
   ok: boolean;
   llm: { ok: boolean; base_url: string; model: string };
-  stt: { ok: boolean; base_url: string; model: string };
+  /** Omitted when the app uses browser Web Speech instead of a server STT service. */
+  stt?: { ok: boolean; base_url: string; model: string };
   piper: { ok: boolean; bin: string; model: string };
   server_time: number;
 }
@@ -336,9 +337,9 @@ export const api = {
     jsonRequest<{
       ok: boolean;
       status: {
-        llm: { ok: boolean; ms: number; err?: string };
-        tts: { ok: boolean; ms: number; err?: string };
-        stt: { ok: boolean; ms: number; err?: string };
+        llm?: { ok: boolean; ms: number; err?: string };
+        tts?: { ok: boolean; ms: number; err?: string };
+        stt?: { ok: boolean; ms: number; err?: string };
       };
     }>("POST", "/api/session/warmup"),
   startSession: (clientID: string) =>

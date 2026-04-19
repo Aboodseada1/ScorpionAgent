@@ -51,10 +51,14 @@ export default function ClientDetailPage() {
     [conversations, facts, actions, docs]
   );
 
-  if (!client) return <div className="p-10 text-ink-400">Loading…</div>;
+  if (!client) {
+    return (
+      <div className="flex-1 min-h-0 flex items-center justify-center p-10 text-ink-400 text-sm">Loading…</div>
+    );
+  }
 
   return (
-    <div className="h-full">
+    <div className="flex-1 min-h-0 overflow-y-auto">
       <div className="px-10 pt-8 pb-4">
         <Link to="/clients" className="inline-flex items-center gap-2 text-sm text-ink-500 hover:text-ink-800">
           <ArrowLeft size={16} /> All clients

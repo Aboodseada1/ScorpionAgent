@@ -21,7 +21,6 @@ import (
 	"scorpion/agent/internal/llm"
 	"scorpion/agent/internal/llmmodels"
 	"scorpion/agent/internal/memory"
-	"scorpion/agent/internal/stt"
 	"scorpion/agent/internal/sysmetrics"
 	"scorpion/agent/internal/tts"
 	"scorpion/agent/internal/voices"
@@ -41,7 +40,7 @@ func main() {
 	defer mem.Close()
 
 	llmClient := llm.NewClient(store)
-	sttClient := stt.NewWhisperHTTP(store)
+	// STT removed - using Chrome Web Speech API only
 	ttsPool := tts.NewPool(store)
 	kbStore := kb.New(mem, store)
 
@@ -73,7 +72,6 @@ func main() {
 	// System metrics collector — watch the services we care about.
 	svcList := []string{
 		envOrDefault("AGENT_SYSTEMD_UNIT", "agent-voice.service"),
-		envOrDefault("WHISPER_SYSTEMD_UNIT", "whisper-server.service"),
 		llmUnit,
 	}
 	metrics := sysmetrics.NewCollector(svcList, []string{"/"})
@@ -82,7 +80,7 @@ func main() {
 		Store:     store,
 		Mem:       mem,
 		LLM:       llmClient,
-		STT:       sttClient,
+		// STT:       nil, // Removed - using Chrome Web Speech API
 		TTS:       ttsPool,
 		KB:        kbStore,
 		Voices:    voiceStore,
@@ -114,7 +112,7 @@ func main() {
 
 	// No boot-time LLM/TTS warmup: weights stay cold until a call needs them.
 	// The web UI calls POST /api/session/warmup when the user starts a call,
-	// which primes LLM + Piper + STT in parallel right before the WebSocket opens.
+	// which primes LLM + Piper in parallel right before the WebSocket opens.
 
 	go func() {
 		slog.Info("http listen", "addr", srv.Addr)

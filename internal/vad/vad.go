@@ -43,12 +43,12 @@ type Segmenter struct {
 }
 
 const (
-	// Require ~200ms of continuous voiced audio before we open an utterance. Short
-	// impulsive sounds (clicks, keyboard taps) stay below this and never reach STT.
-	minOnsetSamples = 3200
-	// First partial caption — lower = earlier live words (Whisper needs ~0.25s+ of audio).
-	partialMinSamples = 4800
-	partialEmitEvery = 45 * time.Millisecond
+	// Require ~100ms of continuous voiced audio before we open an utterance.
+	// Responsive but stable
+	minOnsetSamples = 1600
+	// First partial caption — balanced for good performance
+	partialMinSamples = 2400
+	partialEmitEvery = 150 * time.Millisecond  // Reasonable update frequency
 )
 
 func NewSegmenter(store *config.Store) *Segmenter {
@@ -57,7 +57,7 @@ func NewSegmenter(store *config.Store) *Segmenter {
 		store:        store,
 		minSilenceMs: cfg.VADMinSilenceMs,
 		speechPadMs:  cfg.VADSpeechPadMs,
-		threshold:    float32(cfg.VADThreshold / 10.0), // energy threshold (RMS); VAD_THRESHOLD is 0-1 coarse
+		threshold:    float32(cfg.VADThreshold / 10.0), // Balanced sensitivity
 	}
 }
 

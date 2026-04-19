@@ -55,7 +55,7 @@ func (w *WhisperHTTP) Ping(ctx context.Context) error {
 
 func (w *WhisperHTTP) Transcribe(ctx context.Context, pcm16k []float32) (*Result, error) {
 	cfg := w.store.Snapshot()
-	if len(pcm16k) < 1600 { // <100ms
+	if len(pcm16k) < 800 { // <50ms - much lower threshold
 		return &Result{Text: ""}, nil
 	}
 	wav := audio.Float32ToWav(pcm16k, 16000)
@@ -79,6 +79,8 @@ func (w *WhisperHTTP) Transcribe(ctx context.Context, pcm16k []float32) (*Result
 	// whisper.cpp example server runs inference on the model loaded at startup; this
 	// field is kept for compatibility with other gateways that honor per-request model IDs.
 	_ = mw.WriteField("model", cfg.WhisperModel)
+	// Add word timestamps if available for better partial results
+	_ = mw.WriteField("word_timestamps", "true")
 	mw.Close()
 
 	start := time.Now()

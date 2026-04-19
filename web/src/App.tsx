@@ -30,8 +30,8 @@ export default function App() {
   }, []);
 
   return (
-    <div className="flex h-full w-full bg-paper text-ink-800">
-      <aside className="w-64 shrink-0 border-r border-ink-100 bg-paper flex flex-col">
+    <div className="flex flex-1 min-h-0 w-full bg-paper text-ink-800">
+      <aside className="w-64 shrink-0 border-r border-ink-100 bg-paper flex flex-col min-h-0">
         <div className="px-6 py-6">
           <div className="flex items-center gap-3">
             <div className="h-10 w-10 rounded-2xl bg-ink-800 text-paper grid place-items-center font-display text-lg">S</div>
@@ -51,11 +51,11 @@ export default function App() {
           <StatusCard status={status} />
         </div>
       </aside>
-      <main className="flex-1 h-full overflow-y-auto relative">
+      <main className="flex-1 min-h-0 flex flex-col overflow-hidden relative">
         <AnimatePresence mode="wait" initial={false}>
           <motion.div
             key={location.pathname}
-            className="min-h-full"
+            className="flex-1 min-h-0 flex flex-col overflow-hidden"
             initial={{ opacity: 0, y: 12 }}
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -8 }}
@@ -104,7 +104,8 @@ function StatusCard({ status }: { status: StatusResp | null }) {
       </motion.div>
     );
   }
-  const all = status.llm.ok && status.stt.ok && status.piper.ok;
+  const sttOk = status.stt?.ok ?? true;
+  const all = status.llm.ok && sttOk && status.piper.ok;
   return (
     <motion.div
       layout
@@ -118,7 +119,7 @@ function StatusCard({ status }: { status: StatusResp | null }) {
         {all ? "All systems ready" : "Partially ready"}
       </div>
       <Dot label="LLM" ok={status.llm.ok} sub={status.llm.model} />
-      <Dot label="STT" ok={status.stt.ok} sub={status.stt.model} />
+      <Dot label="STT" ok={sttOk} sub={status.stt?.model ?? "This browser"} />
       <Dot label="TTS" ok={status.piper.ok} sub={status.piper.model ? "piper" : "unset"} />
     </motion.div>
   );
