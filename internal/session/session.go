@@ -259,7 +259,10 @@ func (s *Session) runTurn(ctx context.Context, userText string) {
 		}
 		factLines = llm.CollectFacts(lines)
 	}
-	kbExcerpts, _ := s.Deps.KB.Retrieve(ctx, s.ClientID, userText)
+	// Cap KB/embed latency so a slow embedder does not stall first LLM token.
+	kbCtx, kbCancel := context.WithTimeout(ctx, 2500*time.Millisecond)
+	kbExcerpts, _ := s.Deps.KB.Retrieve(kbCtx, s.ClientID, userText)
+	kbCancel()
 
 	sysPrompt := llm.BuildSystemPrompt(llm.PromptContext{
 		PromptsDir:   cfg.PromptsDir,

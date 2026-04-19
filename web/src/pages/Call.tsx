@@ -1275,6 +1275,20 @@ function AvatarOrb({
   );
 }
 
+function formatMessageTime(ts: number): string {
+  try {
+    return new Intl.DateTimeFormat(undefined, {
+      month: "short",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+      second: "2-digit",
+    }).format(new Date(ts));
+  } catch {
+    return "";
+  }
+}
+
 function MessageBubble({ m }: { m: ChatMessage }) {
   const isUser = m.speaker === "user";
   const baseText = useMemo(
@@ -1300,7 +1314,12 @@ function MessageBubble({ m }: { m: ChatMessage }) {
       transition={{ type: "spring", stiffness: 400, damping: 30 }}
       className={clsx("flex w-full", isUser ? "justify-end" : "justify-start")}
     >
-      <div className="max-w-[min(85%,28rem)] flex flex-col gap-1 items-start">
+      <div
+        className={clsx(
+          "max-w-[min(85%,28rem)] flex flex-col gap-0.5",
+          isUser ? "items-end" : "items-start",
+        )}
+      >
         {!isUser && m.llmRoute && (
           <span
             className={clsx(
@@ -1334,6 +1353,15 @@ function MessageBubble({ m }: { m: ChatMessage }) {
             </>
           )}
         </motion.div>
+        <time
+          dateTime={new Date(m.t).toISOString()}
+          className={clsx(
+            "text-[10px] tabular-nums px-0.5 select-none",
+            isUser ? "text-white/70 text-right" : "text-ink-400",
+          )}
+        >
+          {formatMessageTime(m.t)}
+        </time>
       </div>
     </motion.li>
   );
