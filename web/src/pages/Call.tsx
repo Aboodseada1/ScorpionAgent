@@ -492,7 +492,13 @@ export default function CallPage() {
       const coreOk = Boolean(res.status.llm?.ok && res.status.tts?.ok);
       setUseServerStt(coreOk && Boolean(res.status.stt?.ok));
       if (coreOk && !res.status.stt?.ok) {
-        pushNotice("stt", "Whisper server unavailable — using browser speech for this call.", "warn");
+        const st = res.status.stt;
+        const bits = [st?.err, st?.url].filter(Boolean);
+        pushNotice(
+          "stt",
+          `Whisper server unavailable${bits.length ? ` — ${bits.join(" · ")}` : ""}. Using browser speech for this call.`,
+          "warn",
+        );
       }
       if (!coreOk) {
         pushNotice(

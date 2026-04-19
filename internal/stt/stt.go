@@ -41,16 +41,52 @@ func NewWhisperHTTP(store *config.Store) *WhisperHTTP {
 
 func (w *WhisperHTTP) Ping(ctx context.Context) error {
 	cfg := w.store.Snapshot()
-	r, err := http.NewRequestWithContext(ctx, "GET", strings.TrimRight(cfg.WhisperBaseURL, "/")+"/", nil)
-	if err != nil {
-		return err
+	base := strings.TrimRight(strings.TrimSpace(cfg.WhisperBaseURL), "/")
+	if base == "" {
+		return fmt.Errorf("whisper: WHISPER_BASE_URL is empty")
 	}
-	resp, err := w.http.Do(r)
-	if err != nil {
-		return err
+	// Short client: status/warmup must not block on the 60s transcribe timeout.
+	short := &http.Client{Timeout: 5 * time.Second}
+
+	try := func(path string) (ok bool, err error) {
+		u := base + path
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+		if err != nil {
+			return false, err
+		}
+		resp, err := short.Do(req)
+		if err != nil {
+			return false, fmt.Errorf("GET %s: %w", u, err)
+		}
+		defer resp.Body.Close()
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 512))
+		switch resp.StatusCode {
+		case http.StatusOK, http.StatusNoContent, http.StatusPartialContent:
+			return true, nil
+		case http.StatusServiceUnavailable:
+			return false, fmt.Errorf("GET %s: model still loading (HTTP 503)", u)
+		case http.StatusNotFound:
+			return false, fmt.Errorf("GET %s: HTTP 404", u)
+		default:
+			return false, fmt.Errorf("GET %s: HTTP %d", u, resp.StatusCode)
+		}
 	}
-	defer resp.Body.Close()
-	return nil
+
+	// Current whisper.cpp example server: GET /health → 200 JSON or 503 while loading.
+	if ok, err := try("/health"); ok {
+		return nil
+	} else if err != nil && !strings.Contains(err.Error(), "HTTP 404") {
+		return fmt.Errorf("whisper base %q: %w", base, err)
+	}
+
+	okRoot, errRoot := try("/")
+	if okRoot {
+		return nil
+	}
+	if errRoot != nil {
+		return fmt.Errorf("whisper base %q: /health missing and root check failed: %w", base, errRoot)
+	}
+	return fmt.Errorf("whisper base %q: ping failed", base)
 }
 
 func (w *WhisperHTTP) Transcribe(ctx context.Context, pcm16k []float32) (*Result, error) {

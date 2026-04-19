@@ -339,7 +339,7 @@ export const api = {
       status: {
         llm?: { ok: boolean; ms: number; err?: string };
         tts?: { ok: boolean; ms: number; err?: string };
-        stt?: { ok: boolean; ms: number; err?: string };
+        stt?: { ok: boolean; ms: number; err?: string; url?: string };
       };
     }>("POST", "/api/session/warmup"),
   startSession: (clientID: string) =>

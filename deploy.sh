@@ -7,7 +7,9 @@
 # Environment (optional):
 #   REMOTE_URL        — Git remote (default: https://github.com/Aboodseada1/ScorpionAgent.git)
 #   SYSTEMD_UNITS     — space-separated systemd units to restart after build
-#                       (default: agent-voice.service llama-qwen.service)
+#                       (default: agent-voice.service llama-qwen.service).
+#                       Add your whisper.cpp unit if you use server STT, e.g.:
+#                       SYSTEMD_UNITS="agent-voice.service llama-qwen.service whisper-server.service"
 
 set -euo pipefail
 

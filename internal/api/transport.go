@@ -106,6 +106,7 @@ func handleSessionWarmup(d *Deps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 		defer cancel()
+		snap := d.Store.Snapshot()
 
 		type result struct {
 			name   string
@@ -157,6 +158,9 @@ func handleSessionWarmup(d *Deps) http.HandlerFunc {
 			entry := map[string]any{"ok": res.ok, "ms": res.ms}
 			if res.errMsg != "" {
 				entry["err"] = res.errMsg
+			}
+			if res.name == "stt" {
+				entry["url"] = snap.WhisperBaseURL
 			}
 			status[res.name] = entry
 			if res.name == "stt" {
